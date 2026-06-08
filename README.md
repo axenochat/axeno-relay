@@ -1,6 +1,6 @@
 # Axeno Relay
 
-The Axeno relay is the message broker for [Axeno](https://github.com/axeno-chat/axeno-desktop), a private desktop messenger that uses the Signal Protocol over Tor. This repository is the relay; the desktop client lives in [**axeno-desktop**](https://github.com/axeno-chat/axeno-desktop).
+The Axeno relay is the message broker for [Axeno](https://github.com/axenochat/axeno-desktop), a private desktop messenger that uses the Signal Protocol over Tor. This repository is the relay; the desktop client lives in [**axeno-desktop**](https://github.com/axenochat/axeno-desktop).
 
 > **Status:** early development, not independently audited. Do not rely on it where your safety is at stake.
 
@@ -21,14 +21,16 @@ The setup script downloads the prebuilt relay binary, generates the at-rest key,
 Linux / macOS:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/axeno-chat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
 ```
 
 Windows (in an **elevated** PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/axeno-chat/axeno-relay/main/scripts/setup-relay.ps1 | iex
+irm https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.ps1 | iex
 ```
+
+Before running anything, both scripts verify the download against a `SHA256SUMS` manifest signed with the project's release key (the public key is pinned inside each script), and abort if the signature or checksum does not match. HTTPS alone is not trusted.
 
 On Linux the relay runs under a sandboxed systemd unit with `DynamicUser`; on macOS under a dedicated `_axeno` LaunchDaemon user; on Windows as a scheduled task under the low-privilege `LOCAL SERVICE` account. Pass `--no-service` (bash) or `-NoService` (PowerShell) to set up the binary and config without a service.
 

@@ -7,7 +7,7 @@
 # relay as a hardened, auto-starting service running under its own isolated
 # user.
 #
-#   curl -fsSL https://raw.githubusercontent.com/axeno-chat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
 #
 # Flags:
 #   --no-service     set up the binary + config but do not install a service
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # Repository that publishes releases. Update this if the project moves to an org.
-REPO="axeno-chat/axeno-relay"
+REPO="axenochat/axeno-relay"
 
 ASSUME_YES=0
 INSTALL_SERVICE=1
@@ -77,13 +77,31 @@ esac
 SLUG="${PLATFORM}-${ARCH}"
 ASSET="axeno-server-${SLUG}.tar.gz"
 URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
+SIG_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.sig"
+
+# Public key for verifying release signatures (RSA-3072 / SHA-256). The matching
+# private key (RELAY_SIGNING_KEY) signs SHA256SUMS in CI; see
+# .github/workflows/release.yml. If you rotate the key, update this block and the
+# secret together.
+RELEASE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAumgXLrFiBelXGnDNSem8
+DfotHj4SBAOFso+R/IVIsmFoO9NQkTN1Yn6m3CKF16i5cLO9AGM+mWe6u+jV/2Dd
+VtaXUVfieIvkxstnu1KdFE9D5KFzxwFV0Jlc3Y5zZRNF9zJ9U+YTNq/A4ZTh2S+1
+ujFNnhYwdT6XMpf7qK5RlVtphcxSut4wKciMwBivPquGC6eJAOVj8OZHq6Z0MdND
+QuyegwZGHvulfbEYqv2t0xfaZrOJY24LHn2fxpyX9qfp/T4qgL7MweSHtUg5lFVU
+Psz2/Kv8Zg7ucxH6YgTvLAzU+v7f6pjqTZ89QIn38ubfTYrWr+05Lzw0UY2DrPKU
+kXAiN6wNenAsb7TtBgMa69PzdFdU7IDOqFTNJYIWKkQEDX0vkolJ2qEg29TBg2Ti
+xTvQYjC3Ob/EtAQ2vV0D7NeOYXY/dwjAoQs/7vRPv9ob/JdOu2yktYojQPNSX0yy
+JfY/tFEOiAK8gYrPeZHQADqowZqRCy4OEDe6fUC8wACBAgMBAAE=
+-----END PUBLIC KEY-----'
 
 if [ "$PLATFORM" != linux ]; then
   warn "Running a relay on ${OS} is not recommended for production — Linux is strongly advised."
   confirm "Continue anyway?" n || die "aborted"
 fi
 
-for tool in curl tar; do command -v "$tool" >/dev/null || die "required tool not found: $tool"; done
+for tool in curl tar openssl; do command -v "$tool" >/dev/null || die "required tool not found: $tool"; done
 command -v tor >/dev/null || warn "the 'tor' binary is not on PATH. The relay needs it to publish a .onion address. Install it ($([ "$PLATFORM" = macos ] && echo 'brew install tor' || echo 'apt install tor / dnf install tor')) before starting in production."
 
 gen_key() {
@@ -99,6 +117,24 @@ trap 'rm -rf "$TMP"' EXIT
 info "Downloading $ASSET ..."
 curl -fSL --proto '=https' --tlsv1.2 "$URL" -o "$TMP/relay.tar.gz" \
   || die "download failed. Has a release been published yet? ($URL)"
+
+# Verify authenticity (signed SHA256SUMS) and integrity (hash match) before we
+# unpack or run anything. Fail closed on any problem.
+info "Verifying signature ..."
+curl -fSL --proto '=https' --tlsv1.2 "$SUMS_URL" -o "$TMP/SHA256SUMS" \
+  || die "could not download SHA256SUMS ($SUMS_URL)"
+curl -fSL --proto '=https' --tlsv1.2 "$SIG_URL" -o "$TMP/SHA256SUMS.sig" \
+  || die "could not download SHA256SUMS.sig ($SIG_URL)"
+printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$TMP/relay.pub"
+openssl dgst -sha256 -verify "$TMP/relay.pub" \
+  -signature "$TMP/SHA256SUMS.sig" "$TMP/SHA256SUMS" >/dev/null 2>&1 \
+  || die "SHA256SUMS signature is INVALID — refusing to install a possibly tampered binary."
+want="$(awk -v f="$ASSET" '$2 == f {print $1}' "$TMP/SHA256SUMS")"
+[ -n "$want" ] || die "no checksum entry for $ASSET in the signed SHA256SUMS."
+got="$(openssl dgst -sha256 "$TMP/relay.tar.gz" | awk '{print $NF}')"
+[ "$want" = "$got" ] || die "checksum mismatch for $ASSET (signed $want, got $got) — aborting."
+info "Signature and checksum verified."
+
 tar -xzf "$TMP/relay.tar.gz" -C "$TMP"
 [ -f "$TMP/axeno-server" ] || die "archive did not contain an axeno-server binary"
 chmod +x "$TMP/axeno-server"
@@ -240,7 +276,15 @@ else
   fi
 
   install -d -m 0750 -o "$SVC_USER" "$DATA"
-  KEY="$(gen_key)"
+  # Reuse the existing at-rest key on re-run so data already encrypted under it
+  # stays readable; only mint a fresh key on first install. (Linux/Windows do
+  # the same via their existing-file checks.)
+  if [ -f "$PLIST" ]; then
+    KEY="$(sed -n 's/.*<key>AXENO_KEY<\/key><string>\(.*\)<\/string>.*/\1/p' "$PLIST" | head -1)"
+    if [ -n "$KEY" ]; then info "Reusing existing at-rest key from $PLIST"; else KEY="$(gen_key)"; fi
+  else
+    KEY="$(gen_key)"
+  fi
 
   cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>

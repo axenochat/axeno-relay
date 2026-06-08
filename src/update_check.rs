@@ -18,7 +18,7 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 /// `owner/repo` that publishes Axeno releases.
-const REPO: &str = "axeno-chat/axeno-relay";
+const REPO: &str = "axenochat/axeno-relay";
 /// Version this binary was built from.
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
 /// How often to re-check once enabled.

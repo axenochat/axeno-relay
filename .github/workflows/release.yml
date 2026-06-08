@@ -146,6 +146,27 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Integrity + authenticity: a SHA256SUMS manifest signed with the relay
+      # release key. setup-relay.* verify the signature against a pinned public
+      # key before running the binary, so a tampered or swapped asset is caught
+      # even if the GitHub release itself is compromised.
+      - name: Generate and sign SHA256SUMS
+        env:
+          RELAY_SIGNING_KEY: ${{ secrets.RELAY_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELAY_SIGNING_KEY" ]; then
+            echo "::error::RELAY_SIGNING_KEY secret is not set; cannot sign release." >&2
+            exit 1
+          fi
+          cd dist
+          # Hash only the distributable archives, with bare filenames (no dist/ prefix).
+          sha256sum axeno-server-*.tar.gz axeno-server-*.zip > SHA256SUMS
+          printf '%s\n' "$RELAY_SIGNING_KEY" > "$RUNNER_TEMP/relay-release.key"
+          openssl dgst -sha256 -sign "$RUNNER_TEMP/relay-release.key" \
+            -out SHA256SUMS.sig SHA256SUMS
+          rm -f "$RUNNER_TEMP/relay-release.key"
+          echo "--- SHA256SUMS ---"; cat SHA256SUMS
+
       - name: Create or update the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
