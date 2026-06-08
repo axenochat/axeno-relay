@@ -1,0 +1,321 @@
+//! HTTP/WebSocket entry points and the per-connection frame loop.
+
+use std::sync::atomic::Ordering;
+
+use axum::{
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    response::IntoResponse,
+};
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+use dashmap::mapref::entry::Entry;
+use futures_util::{SinkExt, StreamExt};
+use libsignal_protocol::{PublicKey, SenderCertificate, Timestamp};
+use tokio::sync::mpsc;
+use tracing::{debug, error};
+use uuid::Uuid;
+
+use crate::config::*;
+use crate::persistence::fresh_rng;
+use crate::protocol::{err, send_err, ClientFrame, RecipientId, ServerFrame, StoredEnvelope};
+use crate::state::{AppState, HostedBundle, MailboxAuth};
+use crate::util::{
+    atomic_sub_saturating, now_ms, token_hash, valid_bundle_id, valid_recipient_id, valid_token,
+    verify_pow,
+};
+
+pub(crate) async fn health() -> &'static str { "ok" }
+
+pub(crate) async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.max_message_size(MAX_FRAME_BYTES).on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_CAPACITY);
+
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            match serde_json::to_string(&frame) {
+                Ok(text) => { if sender.send(Message::Text(text.into())).await.is_err() { break; } }
+                Err(e) => error!(?e, "failed to serialize server frame"),
+            }
+        }
+    });
+
+    let mut recipient_id: Option<RecipientId> = None;
+    let mut window_start_ms = now_ms();
+    let mut frame_count: u32 = 0;
+
+    while let Some(incoming) = receiver.next().await {
+        let Ok(msg) = incoming else { break; };
+        let Message::Text(text) = msg else { continue; };
+        let now = now_ms();
+        if now.saturating_sub(window_start_ms) > RATE_WINDOW_MS {
+            window_start_ms = now;
+            frame_count = 0;
+        }
+        frame_count = frame_count.saturating_add(1);
+        if frame_count > MAX_FRAMES_PER_WINDOW { let _ = tx.try_send(err("rate_limited", "too many frames on this socket")); continue; }
+        if text.len() > MAX_FRAME_BYTES { let _ = tx.try_send(err("too_large", "frame too large")); continue; }
+
+        let frame = match serde_json::from_str::<ClientFrame>(&text) {
+            Ok(frame) => frame,
+            Err(e) => { let _ = tx.try_send(err("bad_json", &e.to_string())); continue; }
+        };
+
+        match frame {
+            ClientFrame::Hello { recipient_id: rid, auth_token, delivery_token, protocol_min, protocol_max, protocol_version, pow, cert_only } => {
+                let client_min = protocol_min.unwrap_or(protocol_version.unwrap_or(PROTOCOL_VERSION));
+                let client_max = protocol_max.unwrap_or(protocol_version.unwrap_or(PROTOCOL_VERSION));
+                let selected = PROTOCOL_VERSION.min(client_max);
+                if selected < PROTOCOL_MIN_SUPPORTED || selected < client_min {
+                    let _ = tx.try_send(err("protocol_mismatch", "no common relay protocol version"));
+                    continue;
+                }
+                if !valid_recipient_id(&rid) || !valid_token(&auth_token) || !valid_token(&delivery_token) {
+                    let _ = tx.try_send(err("bad_hello", "invalid mailbox or token"));
+                    continue;
+                }
+                let auth_hash = token_hash(&auth_token);
+                let delivery_hash = token_hash(&delivery_token);
+                let changed = match state.mailbox_auth.entry(rid.clone()) {
+                    Entry::Occupied(mut existing) => {
+                        if existing.get().receive_auth_hash != auth_hash {
+                            let _ = tx.try_send(err("auth_failed", "mailbox auth failed"));
+                            continue;
+                        }
+                        let auth = existing.get_mut();
+                        auth.last_active_ms = now_ms();
+                        auth.ensure_delivery_hash(delivery_hash)
+                    }
+                    Entry::Vacant(vacant) => {
+                        let valid_pow = pow.as_deref().map(|n| verify_pow(&rid, n)).unwrap_or(false);
+                        if !valid_pow {
+                            let _ = tx.try_send(err("bad_pow", "invalid proof of work for new mailbox"));
+                            continue;
+                        }
+                        if !state.reserve_mailbox_slot() {
+                            let _ = tx.try_send(err("relay_full", "relay mailbox limit reached"));
+                            continue;
+                        }
+                        vacant.insert(MailboxAuth::new(auth_hash, delivery_hash));
+                        true
+                    }
+                };
+                if changed { state.mark_dirty(); }
+                recipient_id = Some(rid.clone());
+                let _ = tx.try_send(ServerFrame::HelloOk {
+                    protocol_version: selected,
+                    min_supported: PROTOCOL_MIN_SUPPORTED,
+                    current_protocol: PROTOCOL_VERSION,
+                    server_time_ms: now_ms(),
+                    trust_root_b64: state.crypto.trust_root_public_b64.clone(),
+                });
+                if !cert_only {
+                    state.online.insert(rid.clone(), tx.clone());
+                    state.flush_queue(&rid, &tx);
+                }
+            }
+            ClientFrame::SetDeliveryTokens { request_id, tokens } => {
+                let Some(rid) = recipient_id.as_ref() else { let _ = tx.try_send(err("not_registered", "send hello first")); continue; };
+                if tokens.is_empty() || tokens.len() > MAX_DELIVERY_TOKENS_PER_MAILBOX || !tokens.iter().all(|t| valid_token(t)) {
+                    let _ = tx.try_send(err("bad_tokens", "invalid delivery-token allowlist"));
+                    continue;
+                }
+                if let Some(mut auth) = state.mailbox_auth.get_mut(rid) {
+                    auth.replace_delivery_hashes(tokens.iter().map(|t| token_hash(t)).collect());
+                    let active_count = auth.delivery_token_hashes.len();
+                    drop(auth);
+                    state.mark_dirty();
+                    let _ = tx.try_send(ServerFrame::DeliveryTokensSet { request_id, active_count });
+                } else {
+                    let _ = tx.try_send(err("not_registered", "mailbox auth missing"));
+                }
+            }
+            ClientFrame::IssueSenderCertificate { request_id, sender_uuid, sender_device_id, sender_cert_public_b64 } => {
+                let Some(registered_rid) = recipient_id.as_ref() else {
+                    let _ = tx.try_send(err("not_registered", "send hello first"));
+                    continue;
+                };
+                if &sender_uuid != registered_rid {
+                    let _ = tx.try_send(err("cert_denied", "sender certificate can only be issued for your authenticated mailbox"));
+                    continue;
+                }
+                match issue_sender_certificate(&state, request_id, sender_uuid, sender_device_id, sender_cert_public_b64) {
+                    Ok(frame) => { let _ = tx.try_send(frame); }
+                    Err(e) => { let _ = tx.try_send(err("cert_failed", &e)); }
+                }
+            }
+            ClientFrame::SendEnvelope { client_ref, to, delivery_token, envelope_type, ciphertext } => {
+                if !valid_recipient_id(&to) || !valid_token(&delivery_token) {
+                    let _ = tx.try_send(send_err(client_ref, "bad_send", "invalid destination or delivery token"));
+                    continue;
+                }
+                if envelope_type.len() > 32 || ciphertext.len() > MAX_FRAME_BYTES {
+                    let _ = tx.try_send(send_err(client_ref, "bad_envelope", "envelope rejected by size/type limits"));
+                    continue;
+                }
+                // Validate delivery authorization before counting against any
+                // rate budget, and refresh the destination's activity lease so
+                // an actively-used mailbox is never garbage-collected.
+                {
+                    let Some(mut auth) = state.mailbox_auth.get_mut(&to) else {
+                        let _ = tx.try_send(send_err(client_ref, "delivery_denied", "delivery token rejected"));
+                        continue;
+                    };
+                    if !auth.accepts_delivery_hash(&token_hash(&delivery_token)) {
+                        let _ = tx.try_send(send_err(client_ref, "delivery_denied", "delivery token rejected"));
+                        continue;
+                    }
+                    auth.last_active_ms = now_ms();
+                }
+                // Authoritative global per-destination rate limit. Counts only
+                // accepted sends and is shared across all sockets, so a holder of
+                // a known delivery token cannot flush a victim's queue by opening
+                // many connections.
+                if !state.allow_dest_send(&to) {
+                    let _ = tx.try_send(send_err(client_ref, "rate_limited", "too many sends to this destination"));
+                    continue;
+                }
+                if state.total_queued_bytes.load(Ordering::Relaxed).saturating_add(ciphertext.len()) > MAX_TOTAL_QUEUED_BYTES {
+                    let _ = tx.try_send(send_err(client_ref, "relay_full", "relay queue memory limit reached"));
+                    continue;
+                }
+
+                let env = StoredEnvelope { id: Uuid::new_v4(), to: to.clone(), envelope_type, ciphertext };
+                let delivered_live = if let Some(live) = state.online.get(&to) {
+                    let sent = live.try_send(ServerFrame::Envelope { envelope: env.clone() }).is_ok();
+                    drop(live);
+                    if !sent {
+                        // The relay had a stale socket registered for this mailbox. Do not
+                        // pretend live delivery happened; remove it so the next connection
+                        // can become the live route and keep the envelope queued.
+                        state.online.remove(&to);
+                    }
+                    sent
+                } else {
+                    false
+                };
+
+                {
+                    let mut queue = state.queues.entry(to).or_default();
+                    while queue.len() >= MAX_QUEUE_PER_RECIPIENT {
+                        if let Some(old) = queue.pop_front() {
+                            atomic_sub_saturating(&state.total_queued_bytes, old.ciphertext.len());
+                        }
+                    }
+                    state.total_queued_bytes.fetch_add(env.ciphertext.len(), Ordering::Relaxed);
+                    queue.push_back(env.clone());
+                }
+
+                // Important: do not call mark_dirty/snapshot while holding the
+                // DashMap queue entry guard above. snapshot_disk_state iterates the
+                // same DashMap; holding an entry/ref guard and then re-entering the
+                // map can self-deadlock the relay before SendOk is emitted. On
+                // localhost this presents exactly as messages sitting at "sending"
+                // forever and the recipient never seeing queued envelopes.
+                state.mark_dirty();
+                let _ = tx.try_send(ServerFrame::SendOk { id: env.id, queued: !delivered_live, client_ref });
+            }
+            ClientFrame::UploadBundle { request_id, bundle_id, ciphertext, expires_at_ms, pow } => {
+                if !valid_bundle_id(&bundle_id) || ciphertext.len() > MAX_BUNDLE_BYTES {
+                    let _ = tx.try_send(err("bad_bundle", "invalid invite bundle"));
+                    continue;
+                }
+                // Proof-of-work gates bundle uploads (which are otherwise
+                // unauthenticated) so the global bundle store cannot be cheaply
+                // exhausted by opening many sockets.
+                if !pow.as_deref().map(|n| verify_pow(&bundle_id, n)).unwrap_or(false) {
+                    let _ = tx.try_send(err("bad_pow", "invalid proof of work for invite bundle upload"));
+                    continue;
+                }
+                if state.bundles.len() >= MAX_BUNDLES {
+                    let _ = tx.try_send(err("relay_full", "relay invite bundle limit reached"));
+                    continue;
+                }
+                let now = now_ms();
+                let max_expires = now.saturating_add(MAX_BUNDLE_TTL_MS);
+                let expires = expires_at_ms.min(max_expires).max(now.saturating_add(60_000));
+                state.prune_expired_bundles();
+                let bundle = HostedBundle { id: bundle_id.clone(), ciphertext, created_at_ms: now, expires_at_ms: expires };
+                state.bundles.insert(bundle_id.clone(), bundle);
+                state.mark_dirty();
+                let _ = tx.try_send(ServerFrame::BundleUploaded { request_id, bundle_id, expires_at_ms: expires });
+            }
+            ClientFrame::FetchBundle { request_id, bundle_id } => {
+                state.prune_expired_bundles();
+                match state.bundles.get(&bundle_id) {
+                    Some(bundle) => {
+                        let _ = tx.try_send(ServerFrame::Bundle { request_id, bundle_id: bundle.id.clone(), ciphertext: bundle.ciphertext.clone(), expires_at_ms: bundle.expires_at_ms });
+                    }
+                    None => { let _ = tx.try_send(err("bundle_not_found", "invite bundle was not found or has expired")); }
+                }
+            }
+            ClientFrame::Ack { ids } => {
+                let Some(rid) = recipient_id.as_ref() else { let _ = tx.try_send(err("not_registered", "send hello first")); continue; };
+                let removed = state.remove_acked(rid, &ids);
+                if removed > 0 { state.mark_dirty(); }
+                let _ = tx.try_send(ServerFrame::AckOk { removed });
+            }
+            ClientFrame::RetireMailbox => {
+                let Some(rid) = recipient_id.as_ref() else { let _ = tx.try_send(err("not_registered", "send hello first")); continue; };
+                if state.mailbox_auth.remove(rid).is_some() {
+                    state.mailbox_count.fetch_sub(1, Ordering::Relaxed);
+                }
+                if let Some((_, queue)) = state.queues.remove(rid) {
+                    let freed: usize = queue.iter().map(|e| e.ciphertext.len()).sum();
+                    atomic_sub_saturating(&state.total_queued_bytes, freed);
+                }
+                state.send_rate.remove(rid);
+                state.online.remove(rid);
+                state.mark_dirty();
+                let _ = tx.try_send(ServerFrame::AckOk { removed: 0 });
+                break;
+            }
+            ClientFrame::Ping => { let _ = tx.try_send(ServerFrame::Pong { server_time_ms: now_ms() }); }
+        }
+    }
+
+    if let Some(rid) = recipient_id {
+        // Only remove the online entry if it still points at this socket. A fast
+        // reconnect can install a newer sender before the old socket finishes
+        // unwinding; unconditional remove would make the relay think the mailbox
+        // is offline and messages would sit queued until another reconnect.
+        let remove_this_socket = state
+            .online
+            .get(&rid)
+            .map(|live| live.same_channel(&tx))
+            .unwrap_or(false);
+        if remove_this_socket {
+            state.online.remove(&rid);
+        }
+    }
+    writer.abort();
+    debug!("websocket disconnected");
+}
+
+fn issue_sender_certificate(state: &AppState, request_id: String, sender_uuid: String, sender_device_id: u32, sender_cert_public_b64: String) -> Result<ServerFrame, String> {
+    if !valid_recipient_id(&sender_uuid) || sender_device_id == 0 || sender_device_id > 127 {
+        return Err("invalid sender certificate request".into());
+    }
+    if sender_cert_public_b64.len() > 64 {
+        return Err("sender certificate public key is too large".into());
+    }
+    let cert_key_bytes = STANDARD_NO_PAD.decode(sender_cert_public_b64.as_bytes()).map_err(|_| "bad sender certificate public key encoding".to_string())?;
+    let sender_public = PublicKey::deserialize(&cert_key_bytes).map_err(|e| format!("bad sender certificate public key: {e}"))?;
+    let mut rng = fresh_rng().map_err(|e| e.to_string())?;
+    let expires_at_ms = now_ms().saturating_add(SENDER_CERT_TTL_MS);
+    let sender_device = sender_device_id.try_into().map_err(|_| "bad device id".to_string())?;
+    let cert = SenderCertificate::new(
+        sender_uuid,
+        None,
+        sender_public,
+        sender_device,
+        Timestamp::from_epoch_millis(expires_at_ms),
+        state.crypto.server_certificate.clone(),
+        &state.crypto.server_signing_private,
+        &mut rng,
+    ).map_err(|e| format!("sender certificate signing failed: {e}"))?;
+    let cert_b64 = STANDARD_NO_PAD.encode(cert.serialized().map_err(|e| format!("could not serialize sender certificate: {e}"))?);
+    Ok(ServerFrame::SenderCertificate { request_id, certificate_b64: cert_b64, trust_root_b64: state.crypto.trust_root_public_b64.clone(), expires_at_ms })
+}

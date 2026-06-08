@@ -1,0 +1,24 @@
+# Rust build output
+target/
+
+# Relay runtime data and local onion-service keys
+axeno-relay-data/
+onion_address.txt
+torrc.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
+
+# Assistant/local config
+.claude/

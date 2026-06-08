@@ -1,0 +1,157 @@
+name: Release
+
+# Builds and publishes the relay binary for every supported OS when a version
+# tag is pushed.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Produces, on a single GitHub Release, relay binaries for:
+#   - Linux  x86_64, aarch64
+#   - macOS  x86_64, aarch64
+#   - Windows x86_64, aarch64
+#
+# Asset names are stable and versionless (axeno-server-<os>-<arch>.tar.gz / .zip)
+# so scripts/setup-relay.* can fetch them from releases/latest/download/.
+#
+# Each build job uploads its binary as a workflow artifact; a single final job
+# collects them and creates the (draft) release. Nothing but that final job
+# touches the release, so parallel jobs cannot race on it. Publish the draft to
+# make the setup scripts work.
+#
+# ARM targets build on GitHub's native ARM runners (free for public repos).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+# Only one release run per tag at a time; a newer push cancels an older run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.slug }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - slug: linux-x86_64
+            platform: ubuntu-22.04
+            target: ""
+          - slug: linux-aarch64           # Raspberry Pi 64-bit, ARM servers
+            platform: ubuntu-22.04-arm
+            target: ""
+          - slug: macos-x86_64            # cross-compiled from the arm64 runner
+            platform: macos-latest
+            target: x86_64-apple-darwin
+          - slug: macos-aarch64
+            platform: macos-latest
+            target: aarch64-apple-darwin
+          - slug: windows-x86_64
+            platform: windows-latest
+            target: ""
+          - slug: windows-aarch64
+            platform: windows-11-arm
+            target: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # protoc is needed by libsignal's spqr crate (prost-build) on every OS.
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "28.3"
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\protoc.zip"
+          Expand-Archive "$env:RUNNER_TEMP\protoc.zip" -DestinationPath "$env:RUNNER_TEMP\protoc"
+          "$env:RUNNER_TEMP\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build relay
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          if [ -n "$TARGET" ]; then
+            cargo build --release --target "$TARGET"
+            echo "BIN_DIR=target/$TARGET/release" >> "$GITHUB_ENV"
+          else
+            cargo build --release
+            echo "BIN_DIR=target/release" >> "$GITHUB_ENV"
+          fi
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          mkdir -p dist
+          tar -czf "dist/axeno-server-${SLUG}.tar.gz" -C "$BIN_DIR" axeno-server
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          SLUG: ${{ matrix.slug }}
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "$env:BIN_DIR/axeno-server.exe" -DestinationPath "dist/axeno-server-$env:SLUG.zip" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          ls -la dist
+          if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$REPO"
+          else
+            gh release create "$TAG" -R "$REPO" --draft \
+              --title "Axeno relay $TAG" \
+              --notes "Relay binaries for $TAG. See README for setup." \
+              dist/*
+          fi
