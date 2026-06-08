@@ -43,7 +43,7 @@ Requirements: Rust stable ([rustup](https://rustup.rs)), `protoc` (`apt install 
 ```bash
 cargo build --release
 echo "AXENO_KEY=$(openssl rand -hex 32)" > .env   # at-rest key
-./target/release/axeno-server
+./target/release/axeno-relay
 ```
 
 ## Configuration

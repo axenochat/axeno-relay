@@ -75,7 +75,7 @@ case "$ARCH" in
   *) die "unsupported architecture: $ARCH" ;;
 esac
 SLUG="${PLATFORM}-${ARCH}"
-ASSET="axeno-server-${SLUG}.tar.gz"
+ASSET="axeno-relay-${SLUG}.tar.gz"
 URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 SUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
 SIG_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.sig"
@@ -136,8 +136,8 @@ got="$(openssl dgst -sha256 "$TMP/relay.tar.gz" | awk '{print $NF}')"
 info "Signature and checksum verified."
 
 tar -xzf "$TMP/relay.tar.gz" -C "$TMP"
-[ -f "$TMP/axeno-server" ] || die "archive did not contain an axeno-server binary"
-chmod +x "$TMP/axeno-server"
+[ -f "$TMP/axeno-relay" ] || die "archive did not contain an axeno-relay binary"
+chmod +x "$TMP/axeno-relay"
 
 # --------------------------------------------------------------------------
 # Install. Two modes: hardened system service, or a local unprivileged setup.
@@ -150,7 +150,7 @@ if [ "$INSTALL_SERVICE" = 0 ]; then
   # --- Local, no service: install next to the user, write a .env, print run cmd.
   DEST="${PWD}/axeno-relay"
   mkdir -p "$DEST"
-  install -m 0755 "$TMP/axeno-server" "$DEST/axeno-server"
+  install -m 0755 "$TMP/axeno-relay" "$DEST/axeno-relay"
   ENV_FILE="$DEST/.env"
   if [ -f "$ENV_FILE" ]; then
     warn "$ENV_FILE already exists; leaving its AXENO_KEY untouched."
@@ -160,7 +160,7 @@ if [ "$INSTALL_SERVICE" = 0 ]; then
     chmod 600 "$ENV_FILE"
   fi
   info "Installed to $DEST"
-  info "Start it with:  cd '$DEST' && ./axeno-server"
+  info "Start it with:  cd '$DEST' && ./axeno-relay"
   info "The .env holds your at-rest key — back it up and keep it private."
   exit 0
 fi
@@ -170,8 +170,8 @@ if [ "$(id -u)" -ne 0 ]; then
   die "installing a service needs root. Re-run with sudo, e.g.:  sudo bash $0"
 fi
 
-BIN_DEST=/usr/local/bin/axeno-server
-install -m 0755 "$TMP/axeno-server" "$BIN_DEST"
+BIN_DEST=/usr/local/bin/axeno-relay
+install -m 0755 "$TMP/axeno-relay" "$BIN_DEST"
 info "Installed binary to $BIN_DEST"
 
 if [ "$PLATFORM" = linux ]; then
@@ -207,7 +207,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/axeno/relay.env
-ExecStart=/usr/local/bin/axeno-server
+ExecStart=/usr/local/bin/axeno-relay
 Restart=on-failure
 RestartSec=5
 

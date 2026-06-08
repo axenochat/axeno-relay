@@ -48,7 +48,7 @@ switch ($arch) {
   "X64"   { $slug = "windows-x86_64" }
   default { throw "unsupported Windows architecture: $arch" }
 }
-$asset   = "axeno-server-$slug.zip"
+$asset   = "axeno-relay-$slug.zip"
 $url     = "https://github.com/$Repo/releases/latest/download/$asset"
 $sumsUrl = "https://github.com/$Repo/releases/latest/download/SHA256SUMS"
 $sigUrl  = "https://github.com/$Repo/releases/latest/download/SHA256SUMS.sig"
@@ -109,14 +109,14 @@ try {
   Info "Signature and checksum verified."
 
   Expand-Archive -Path $zip -DestinationPath $tmp -Force
-  $exe = Join-Path $tmp "axeno-server.exe"
-  if (-not (Test-Path $exe)) { throw "archive did not contain axeno-server.exe" }
+  $exe = Join-Path $tmp "axeno-relay.exe"
+  if (-not (Test-Path $exe)) { throw "archive did not contain axeno-relay.exe" }
 
   # --- No-service: local folder + launcher --------------------------------
   if ($NoService) {
     $dest = Join-Path (Get-Location) "axeno-relay"
     New-Item -ItemType Directory -Path $dest -Force | Out-Null
-    Copy-Item $exe (Join-Path $dest "axeno-server.exe") -Force
+    Copy-Item $exe (Join-Path $dest "axeno-relay.exe") -Force
     $launcher = Join-Path $dest "run-relay.cmd"
     if (-not (Test-Path $launcher)) {
       $key = New-Key
@@ -124,7 +124,7 @@ try {
 @echo off
 set "AXENO_KEY=$key"
 set "AXENO_BIND=$Bind"
-"%~dp0axeno-server.exe"
+"%~dp0axeno-relay.exe"
 "@ | Set-Content -Path $launcher -Encoding ASCII
     }
     Info "Installed to $dest"
@@ -142,7 +142,7 @@ set "AXENO_BIND=$Bind"
   $dataDir    = Join-Path $env:ProgramData "Axeno"
   New-Item -ItemType Directory -Path $installDir -Force | Out-Null
   New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
-  Copy-Item $exe (Join-Path $installDir "axeno-server.exe") -Force
+  Copy-Item $exe (Join-Path $installDir "axeno-relay.exe") -Force
 
   # Launcher carries the environment; the relay (LOCAL SERVICE) reads it at start.
   $launcher = Join-Path $dataDir "run-relay.cmd"
@@ -155,7 +155,7 @@ set "AXENO_BIND=$Bind"
 set "AXENO_KEY=$key"
 set "AXENO_BIND=$Bind"
 set "AXENO_DATA_DIR=$dataDir"
-"$installDir\axeno-server.exe"
+"$installDir\axeno-relay.exe"
 "@ | Set-Content -Path $launcher -Encoding ASCII
     Info "Generated at-rest key in $launcher. Back this file up."
   }

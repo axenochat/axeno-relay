@@ -66,7 +66,7 @@ fn enabled() -> bool {
 async fn check_once() -> anyhow::Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let client = reqwest::Client::builder()
-        .user_agent(concat!("axeno-server/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("axeno-relay/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(30))
         .build()?;
 

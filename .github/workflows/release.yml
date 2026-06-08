@@ -10,7 +10,7 @@ name: Release
 #   - macOS  x86_64, aarch64
 #   - Windows x86_64, aarch64
 #
-# Asset names are stable and versionless (axeno-server-<os>-<arch>.tar.gz / .zip)
+# Asset names are stable and versionless (axeno-relay-<os>-<arch>.tar.gz / .zip)
 # so scripts/setup-relay.* can fetch them from releases/latest/download/.
 #
 # Each build job uploads its binary as a workflow artifact; a single final job
@@ -126,7 +126,7 @@ jobs:
           SLUG: ${{ matrix.slug }}
         run: |
           mkdir -p dist
-          tar -czf "dist/axeno-server-${SLUG}.tar.gz" -C "$BIN_DIR" axeno-server
+          tar -czf "dist/axeno-relay-${SLUG}.tar.gz" -C "$BIN_DIR" axeno-relay
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'
@@ -135,7 +135,7 @@ jobs:
           SLUG: ${{ matrix.slug }}
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "$env:BIN_DIR/axeno-server.exe" -DestinationPath "dist/axeno-server-$env:SLUG.zip" -Force
+          Compress-Archive -Path "$env:BIN_DIR/axeno-relay.exe" -DestinationPath "dist/axeno-relay-$env:SLUG.zip" -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -169,25 +169,27 @@ jobs:
           fi
           cd dist
           # Hash only the distributable archives, with bare filenames (no dist/ prefix).
-          sha256sum axeno-server-*.tar.gz axeno-server-*.zip > SHA256SUMS
+          sha256sum axeno-relay-*.tar.gz axeno-relay-*.zip > SHA256SUMS
           printf '%s\n' "$RELAY_SIGNING_KEY" > "$RUNNER_TEMP/relay-release.key"
           openssl dgst -sha256 -sign "$RUNNER_TEMP/relay-release.key" \
             -out SHA256SUMS.sig SHA256SUMS
           rm -f "$RUNNER_TEMP/relay-release.key"
           echo "--- SHA256SUMS ---"; cat SHA256SUMS
 
-      - name: Create or update the draft release
+      - name: Create the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
           ls -la dist
+          # Delete any existing release for this tag (keeping the git tag) so a
+          # re-run starts from a clean asset list and never leaves renamed or
+          # removed assets lingering. Then create fresh.
           if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber -R "$REPO"
-          else
-            gh release create "$TAG" -R "$REPO" --draft \
-              --title "Axeno relay $TAG" \
-              --notes "Relay binaries for $TAG. See README for setup." \
-              dist/*
+            gh release delete "$TAG" -R "$REPO" --yes
           fi
+          gh release create "$TAG" -R "$REPO" --draft \
+            --title "Axeno relay $TAG" \
+            --notes "Relay binaries for $TAG. See README for setup." \
+            dist/*
