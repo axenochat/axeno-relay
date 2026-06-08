@@ -292,7 +292,9 @@ pub(crate) fn snapshot_disk_state(state: &crate::state::AppState) -> anyhow::Res
         crypto: None,
         encrypted_crypto: None,
         mailbox_auth: state.mailbox_auth.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect(),
-        queues: state.queues.iter().map(|entry| (entry.key().clone(), entry.value().iter().cloned().collect())).collect(),
+        // Offline queues live in the disk-backed QueueStore now, not in this JSON
+        // snapshot. The field stays only to migrate any legacy state on load.
+        queues: Vec::new(),
         bundles: state.bundles.iter().map(|entry| entry.value().clone()).collect(),
     };
 

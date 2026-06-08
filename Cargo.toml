@@ -8,6 +8,7 @@ description = "Minimal Axeno WebSocket relay server for opaque encrypted envelop
 anyhow = "1"
 axum = { version = "0.7", features = ["ws"] }
 dashmap = "6"
+redb = "4"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -38,6 +39,9 @@ hex = "0.4"
 # us off the system OpenSSL; only json + the TLS client are pulled in.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 semver = "1"
+
+[dev-dependencies]
+tempfile = "3"
 
 [patch.crates-io]
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

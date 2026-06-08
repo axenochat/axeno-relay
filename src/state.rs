@@ -1,6 +1,5 @@
 //! Shared runtime state and the operations that read or mutate it.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -9,14 +8,14 @@ use dashmap::DashMap;
 use libsignal_protocol::{PrivateKey, ServerCertificate};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use uuid::Uuid;
 
 use crate::config::{
     MAILBOX_IDLE_TTL_MS, MAX_DELIVERY_TOKENS_PER_MAILBOX, MAX_MAILBOXES,
     MAX_SENDS_PER_DEST_PER_WINDOW, RATE_WINDOW_MS,
 };
 use crate::persistence::{DiskCrypto, DiskState};
-use crate::protocol::{ClientTx, RecipientId, ServerFrame, StoredEnvelope};
+use crate::protocol::{ClientTx, RecipientId};
+use crate::queue_store::QueueStore;
 use crate::util::now_ms;
 
 /// Server signing material kept hot in memory for issuing sender certificates.
@@ -89,12 +88,14 @@ pub(crate) struct HostedBundle {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    pub(crate) queues: Arc<DashMap<RecipientId, VecDeque<StoredEnvelope>>>,
+    /// Durable, disk-backed per-mailbox offline message queues.
+    pub(crate) queues: Arc<QueueStore>,
     pub(crate) online: Arc<DashMap<RecipientId, ClientTx>>,
     pub(crate) mailbox_auth: Arc<DashMap<RecipientId, MailboxAuth>>,
     pub(crate) mailbox_count: Arc<AtomicUsize>,
     pub(crate) bundles: Arc<DashMap<String, HostedBundle>>,
-    pub(crate) total_queued_bytes: Arc<AtomicUsize>,
+    /// Running total of hosted-bundle ciphertext bytes, for the total-byte cap.
+    pub(crate) total_bundle_bytes: Arc<AtomicUsize>,
     /// Global per-destination send-rate window, keyed by destination mailbox.
     /// Value is (window_start_ms, count_in_window). This is authoritative across
     /// all sockets so an attacker cannot bypass the limit by opening many
@@ -110,8 +111,9 @@ pub(crate) struct AppState {
 impl AppState {
     /// Build live in-memory state from a loaded disk snapshot. `crypto` is the
     /// initialized server signing material; `disk` must already have its crypto
-    /// key material populated (see `init_server_crypto`).
-    pub(crate) fn build(disk: &DiskState, data_dir: PathBuf, crypto: ServerCrypto) -> AppState {
+    /// key material populated (see `init_server_crypto`). `queues` is the opened
+    /// disk-backed queue store.
+    pub(crate) fn build(disk: &DiskState, data_dir: PathBuf, crypto: ServerCrypto, queues: Arc<QueueStore>) -> AppState {
         let mailbox_auth = Arc::new(DashMap::new());
         let load_now = now_ms();
         for (rid, mut auth) in disk.mailbox_auth.iter().cloned() {
@@ -122,16 +124,10 @@ impl AppState {
             mailbox_auth.insert(rid, auth);
         }
 
-        let queues = Arc::new(DashMap::new());
-        let mut queued_bytes = 0usize;
-        for (rid, queue) in disk.queues.iter().cloned() {
-            let queue: VecDeque<StoredEnvelope> = queue.into_iter().collect();
-            queued_bytes = queued_bytes.saturating_add(queue.iter().map(|e| e.ciphertext.len()).sum::<usize>());
-            queues.insert(rid, queue);
-        }
-
         let bundles = Arc::new(DashMap::new());
+        let mut bundle_bytes = 0usize;
         for bundle in disk.bundles.iter().cloned() {
+            bundle_bytes = bundle_bytes.saturating_add(bundle.ciphertext.len());
             bundles.insert(bundle.id.clone(), bundle);
         }
 
@@ -144,7 +140,7 @@ impl AppState {
             mailbox_count,
             mailbox_auth,
             bundles,
-            total_queued_bytes: Arc::new(AtomicUsize::new(queued_bytes)),
+            total_bundle_bytes: Arc::new(AtomicUsize::new(bundle_bytes)),
             send_rate: Arc::new(DashMap::new()),
             crypto: Arc::new(crypto),
             disk_crypto: Arc::new(disk_crypto),
@@ -194,52 +190,33 @@ impl AppState {
         true
     }
 
-    /// Send every queued envelope for `rid` down a freshly connected socket.
-    pub(crate) fn flush_queue(&self, rid: &str, tx: &ClientTx) {
-        if let Some(queue) = self.queues.get(rid) {
-            for env in queue.iter() {
-                if tx.try_send(ServerFrame::Envelope { envelope: env.clone() }).is_err() { break; }
-            }
-        }
-    }
-
-    /// Remove acknowledged envelopes from a mailbox queue; returns the count
-    /// removed and frees their bytes from the global accounting.
-    pub(crate) fn remove_acked(&self, rid: &str, ids: &[Uuid]) -> usize {
-        let Some(mut queue) = self.queues.get_mut(rid) else { return 0; };
-        let before = queue.len();
-        let mut freed = 0usize;
-        let ids_set: std::collections::HashSet<_> = ids.iter().collect();
-        queue.retain(|env| {
-            let remove = ids_set.contains(&env.id);
-            if remove { freed += env.ciphertext.len(); }
-            !remove
-        });
-        crate::util::atomic_sub_saturating(&self.total_queued_bytes, freed);
-        before - queue.len()
-    }
-
-    /// Drop expired invite bundles.
+    /// Drop expired invite bundles, keeping the bundle byte total in sync.
     pub(crate) fn prune_expired_bundles(&self) {
         let now = now_ms();
-        let expired: Vec<String> = self.bundles.iter()
+        let expired: Vec<(String, usize)> = self.bundles.iter()
             .filter(|entry| entry.value().expires_at_ms <= now)
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), entry.value().ciphertext.len()))
             .collect();
-        if !expired.is_empty() {
-            for id in expired { self.bundles.remove(&id); }
-            self.mark_dirty();
+        if expired.is_empty() { return; }
+        let mut freed = 0usize;
+        for (id, len) in expired {
+            if self.bundles.remove(&id).is_some() { freed = freed.saturating_add(len); }
         }
+        crate::util::atomic_sub_saturating(&self.total_bundle_bytes, freed);
+        self.mark_dirty();
     }
 
     /// Sweep idle mailboxes whose queue is empty and that have no live socket.
+    /// Disk I/O on the queue store happens here; call off the request path.
     pub(crate) fn gc_idle_mailboxes(&self) {
         let now = now_ms();
-        let stale: Vec<RecipientId> = self.mailbox_auth.iter()
+        let candidates: Vec<RecipientId> = self.mailbox_auth.iter()
             .filter(|entry| now.saturating_sub(entry.value().last_active_ms) > MAILBOX_IDLE_TTL_MS)
             .map(|entry| entry.key().clone())
+            .collect();
+        let stale: Vec<RecipientId> = candidates.into_iter()
             .filter(|rid| {
-                let queue_empty = self.queues.get(rid).map(|q| q.is_empty()).unwrap_or(true);
+                let queue_empty = self.queues.is_empty(rid).unwrap_or(true);
                 let offline = !self.online.contains_key(rid);
                 queue_empty && offline
             })
@@ -251,7 +228,7 @@ impl AppState {
                 self.mailbox_count.fetch_sub(1, Ordering::Relaxed);
                 removed += 1;
             }
-            self.queues.remove(rid);
+            let _ = self.queues.purge_mailbox(rid);
             self.send_rate.remove(rid);
         }
         if removed > 0 {

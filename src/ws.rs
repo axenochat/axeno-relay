@@ -113,7 +113,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 });
                 if !cert_only {
                     state.online.insert(rid.clone(), tx.clone());
-                    state.flush_queue(&rid, &tx);
+                    let store = state.queues.clone();
+                    let rid_for_flush = rid.clone();
+                    if let Ok(Ok(envs)) = tokio::task::spawn_blocking(move || store.flush(&rid_for_flush)).await {
+                        for env in envs {
+                            if tx.try_send(ServerFrame::Envelope { envelope: env }).is_err() { break; }
+                        }
+                    }
                 }
             }
             ClientFrame::SetDeliveryTokens { request_id, tokens } => {
@@ -177,19 +183,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let _ = tx.try_send(send_err(client_ref, "rate_limited", "too many sends to this destination"));
                     continue;
                 }
-                if state.total_queued_bytes.load(Ordering::Relaxed).saturating_add(ciphertext.len()) > MAX_TOTAL_QUEUED_BYTES {
-                    let _ = tx.try_send(send_err(client_ref, "relay_full", "relay queue memory limit reached"));
-                    continue;
-                }
-
                 let env = StoredEnvelope { id: Uuid::new_v4(), to: to.clone(), envelope_type, ciphertext };
+                let env_id = env.id;
+
+                // Live delivery is attempted first and is never gated by the
+                // offline-queue storage budget: an online recipient always gets
+                // the message even when offline storage is full.
                 let delivered_live = if let Some(live) = state.online.get(&to) {
                     let sent = live.try_send(ServerFrame::Envelope { envelope: env.clone() }).is_ok();
                     drop(live);
                     if !sent {
-                        // The relay had a stale socket registered for this mailbox. Do not
-                        // pretend live delivery happened; remove it so the next connection
-                        // can become the live route and keep the envelope queued.
+                        // Stale socket; drop it so the next connection becomes the
+                        // live route and the envelope still gets queued below.
                         state.online.remove(&to);
                     }
                     sent
@@ -197,25 +202,32 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     false
                 };
 
-                {
-                    let mut queue = state.queues.entry(to).or_default();
-                    while queue.len() >= MAX_QUEUE_PER_RECIPIENT {
-                        if let Some(old) = queue.pop_front() {
-                            atomic_sub_saturating(&state.total_queued_bytes, old.ciphertext.len());
-                        }
+                // Persist for offline pickup in the durable disk-backed store.
+                // Only offline queueing is bounded by the global disk backstop;
+                // a full store never blocks the live delivery above.
+                if state.queues.would_exceed_global(env.ciphertext.len()) {
+                    if delivered_live {
+                        let _ = tx.try_send(ServerFrame::SendOk { id: env_id, queued: false, client_ref });
+                    } else {
+                        let _ = tx.try_send(send_err(client_ref, "relay_full", "relay queue storage limit reached"));
                     }
-                    state.total_queued_bytes.fetch_add(env.ciphertext.len(), Ordering::Relaxed);
-                    queue.push_back(env.clone());
+                    continue;
                 }
-
-                // Important: do not call mark_dirty/snapshot while holding the
-                // DashMap queue entry guard above. snapshot_disk_state iterates the
-                // same DashMap; holding an entry/ref guard and then re-entering the
-                // map can self-deadlock the relay before SendOk is emitted. On
-                // localhost this presents exactly as messages sitting at "sending"
-                // forever and the recipient never seeing queued envelopes.
+                let store = state.queues.clone();
+                let env_for_store = env.clone();
+                let to_for_store = to.clone();
+                let enqueued = tokio::task::spawn_blocking(move || store.enqueue(&to_for_store, &env_for_store))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .is_some();
+                // Persist the destination mailbox's refreshed activity lease.
                 state.mark_dirty();
-                let _ = tx.try_send(ServerFrame::SendOk { id: env.id, queued: !delivered_live, client_ref });
+                if enqueued || delivered_live {
+                    let _ = tx.try_send(ServerFrame::SendOk { id: env_id, queued: !delivered_live, client_ref });
+                } else {
+                    let _ = tx.try_send(send_err(client_ref, "relay_error", "could not persist message for offline delivery"));
+                }
             }
             ClientFrame::UploadBundle { request_id, bundle_id, ciphertext, expires_at_ms, pow } => {
                 if !valid_bundle_id(&bundle_id) || ciphertext.len() > MAX_BUNDLE_BYTES {
@@ -229,16 +241,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let _ = tx.try_send(err("bad_pow", "invalid proof of work for invite bundle upload"));
                     continue;
                 }
+                state.prune_expired_bundles();
                 if state.bundles.len() >= MAX_BUNDLES {
                     let _ = tx.try_send(err("relay_full", "relay invite bundle limit reached"));
+                    continue;
+                }
+                let bundle_len = ciphertext.len();
+                if state.total_bundle_bytes.load(Ordering::Relaxed).saturating_add(bundle_len) > MAX_TOTAL_BUNDLE_BYTES {
+                    let _ = tx.try_send(err("relay_full", "relay invite bundle storage limit reached"));
                     continue;
                 }
                 let now = now_ms();
                 let max_expires = now.saturating_add(MAX_BUNDLE_TTL_MS);
                 let expires = expires_at_ms.min(max_expires).max(now.saturating_add(60_000));
-                state.prune_expired_bundles();
                 let bundle = HostedBundle { id: bundle_id.clone(), ciphertext, created_at_ms: now, expires_at_ms: expires };
-                state.bundles.insert(bundle_id.clone(), bundle);
+                if let Some(old) = state.bundles.insert(bundle_id.clone(), bundle) {
+                    atomic_sub_saturating(&state.total_bundle_bytes, old.ciphertext.len());
+                }
+                state.total_bundle_bytes.fetch_add(bundle_len, Ordering::Relaxed);
                 state.mark_dirty();
                 let _ = tx.try_send(ServerFrame::BundleUploaded { request_id, bundle_id, expires_at_ms: expires });
             }
@@ -253,8 +273,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             }
             ClientFrame::Ack { ids } => {
                 let Some(rid) = recipient_id.as_ref() else { let _ = tx.try_send(err("not_registered", "send hello first")); continue; };
-                let removed = state.remove_acked(rid, &ids);
-                if removed > 0 { state.mark_dirty(); }
+                let store = state.queues.clone();
+                let rid_c = rid.clone();
+                let removed = tokio::task::spawn_blocking(move || store.ack(&rid_c, &ids))
+                    .await.ok().and_then(|r| r.ok()).unwrap_or(0);
                 let _ = tx.try_send(ServerFrame::AckOk { removed });
             }
             ClientFrame::RetireMailbox => {
@@ -262,10 +284,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 if state.mailbox_auth.remove(rid).is_some() {
                     state.mailbox_count.fetch_sub(1, Ordering::Relaxed);
                 }
-                if let Some((_, queue)) = state.queues.remove(rid) {
-                    let freed: usize = queue.iter().map(|e| e.ciphertext.len()).sum();
-                    atomic_sub_saturating(&state.total_queued_bytes, freed);
-                }
+                let store = state.queues.clone();
+                let rid_c = rid.clone();
+                let _ = tokio::task::spawn_blocking(move || store.purge_mailbox(&rid_c)).await;
                 state.send_rate.remove(rid);
                 state.online.remove(rid);
                 state.mark_dirty();

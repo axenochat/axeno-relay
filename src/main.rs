@@ -27,20 +27,22 @@
 mod config;
 mod persistence;
 mod protocol;
+mod queue_store;
 mod state;
 mod tor;
 mod update_check;
 mod util;
 mod ws;
 
-use std::{fs, net::SocketAddr, path::PathBuf, sync::atomic::Ordering, time::Duration};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::atomic::Ordering, sync::Arc, time::Duration};
 
 use axum::{routing::get, Router};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::config::MAILBOX_GC_INTERVAL_SECS;
+use crate::config::{MAILBOX_GC_INTERVAL_SECS, QUEUE_SWEEP_INTERVAL_SECS};
 use crate::persistence::{init_server_crypto, load_disk_state, prune_disk_state, save_disk_state, snapshot_disk_state};
+use crate::queue_store::QueueStore;
 use crate::state::AppState;
 use crate::tor::start_tor_hidden_service;
 use crate::ws::{health, ws_handler};
@@ -69,12 +71,26 @@ async fn main() -> anyhow::Result<()> {
     let mut disk = load_disk_state(&data_dir)?;
     let crypto = init_server_crypto(&mut disk)?;
     prune_disk_state(&mut disk);
+
+    // Disk-backed offline queues. Opened before save so a one-time migration of
+    // any legacy in-JSON queues lands in the store and is then dropped from the
+    // JSON snapshot.
+    let queues = Arc::new(QueueStore::open(&data_dir.join("queues.redb"))?);
+    let legacy_queued: usize = disk.queues.iter().map(|(_, v)| v.len()).sum();
+    if legacy_queued > 0 {
+        for (rid, envs) in &disk.queues {
+            for env in envs { let _ = queues.enqueue(rid, env); }
+        }
+        info!(migrated = legacy_queued, "migrated legacy in-JSON offline queues into the disk-backed store");
+    }
+    disk.queues.clear();
     save_disk_state(&data_dir, &disk)?;
 
-    let state = AppState::build(&disk, data_dir.clone(), crypto);
+    let state = AppState::build(&disk, data_dir.clone(), crypto, queues);
 
     spawn_persistence_task(state.clone());
     spawn_mailbox_gc_task(state.clone());
+    spawn_queue_sweep_task(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -124,7 +140,28 @@ fn spawn_mailbox_gc_task(state: AppState) {
         interval.tick().await; // skip the immediate first tick
         loop {
             interval.tick().await;
-            state.gc_idle_mailboxes();
+            // gc_idle_mailboxes touches the disk-backed queue store; keep that
+            // blocking work off the async runtime.
+            let s = state.clone();
+            let _ = tokio::task::spawn_blocking(move || s.gc_idle_mailboxes()).await;
+        }
+    });
+}
+
+/// Periodically sweep offline-queue envelopes older than the TTL so abandoned or
+/// attack-created queues self-heal instead of pinning disk storage.
+fn spawn_queue_sweep_task(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(QUEUE_SWEEP_INTERVAL_SECS));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            let s = state.clone();
+            match tokio::task::spawn_blocking(move || s.queues.sweep_expired()).await {
+                Ok(Ok(n)) if n > 0 => info!(expired = n, "swept expired queued envelopes"),
+                Ok(Err(e)) => warn!("queue sweep failed: {e}"),
+                _ => {}
+            }
         }
     });
 }
