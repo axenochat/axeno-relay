@@ -35,27 +35,33 @@ concurrency:
 
 jobs:
   build:
-    name: Build (${{ matrix.slug }})
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - slug: linux-x86_64
+          - name: Linux x64 (tar.gz)
+            slug: linux-x86_64
             platform: ubuntu-22.04
             target: ""
-          - slug: linux-aarch64           # Raspberry Pi 64-bit, ARM servers
+          - name: Linux Arm64 (tar.gz)         # Raspberry Pi 64-bit, ARM servers
+            slug: linux-aarch64
             platform: ubuntu-22.04-arm
             target: ""
-          - slug: macos-x86_64            # cross-compiled from the arm64 runner
+          - name: Macos Intel (tar.gz)         # cross-compiled from the arm64 runner
+            slug: macos-x86_64
             platform: macos-latest
             target: x86_64-apple-darwin
-          - slug: macos-aarch64
+          - name: Macos Arm (tar.gz)
+            slug: macos-aarch64
             platform: macos-latest
             target: aarch64-apple-darwin
-          - slug: windows-x86_64
+          - name: Windows x64 (zip)
+            slug: windows-x86_64
             platform: windows-latest
             target: ""
-          - slug: windows-aarch64
+          - name: Windows Arm64 (zip)
+            slug: windows-aarch64
             platform: windows-11-arm
             target: ""
     runs-on: ${{ matrix.platform }}
