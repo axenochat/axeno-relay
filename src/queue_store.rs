@@ -17,10 +17,11 @@
 //! plus the routing metadata the relay already sees (destination mailbox,
 //! envelope type, id, enqueue time).
 
-use std::path::Path;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use anyhow::Context;
+use dashmap::DashMap;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -52,13 +53,20 @@ struct StoredValue {
 }
 
 pub(crate) struct QueueStore {
-    db: Database,
+    db: Arc<Database>,
     /// Running total of queued ciphertext bytes across all mailboxes, kept in
     /// RAM for an O(1) global backstop check. Rebuilt by a full scan on open.
     total_bytes: AtomicUsize,
     /// Monotonic enqueue counter for FIFO ordering. Seeded past the max stored
     /// sequence on open so ordering survives restarts.
     next_seq: AtomicU64,
+    /// Per-mailbox `(count, bytes)` index, so the common-case enqueue can check
+    /// the per-mailbox caps without reading and deserializing the entire mailbox.
+    /// Only an enqueue that actually trips a cap falls back to reading the mailbox
+    /// contents to choose what to evict. Rebuilt by a full scan on open; kept
+    /// approximately in sync thereafter (caps are intentionally loose, like the
+    /// global byte total), so a small drift can never panic or corrupt the store.
+    index: DashMap<String, (usize, usize)>,
 }
 
 fn key_for(mailbox: &str, id: &Uuid) -> String {
@@ -71,31 +79,40 @@ fn mailbox_bounds(mailbox: &str) -> (String, String) {
 }
 
 impl QueueStore {
-    pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
-        let db = Database::create(path).context("could not open queue database")?;
+    /// Open the queue table on a shared redb database. The same `Database` also
+    /// backs the mailbox-auth/bundle [`MetaStore`](crate::meta_store), so all
+    /// relay durable state lives in one ACID file.
+    pub(crate) fn new(db: Arc<Database>) -> anyhow::Result<Self> {
         // Ensure the table exists so read transactions never fail on a fresh db.
         {
             let txn = db.begin_write()?;
             { let _ = txn.open_table(ENVELOPES)?; }
             txn.commit()?;
         }
-        let store = QueueStore { db, total_bytes: AtomicUsize::new(0), next_seq: AtomicU64::new(0) };
+        let store = QueueStore { db, total_bytes: AtomicUsize::new(0), next_seq: AtomicU64::new(0), index: DashMap::new() };
         let (total, max_seq) = store.scan_totals()?;
         store.total_bytes.store(total, Ordering::Relaxed);
         store.next_seq.store(max_seq.saturating_add(1), Ordering::Relaxed);
         Ok(store)
     }
 
+    /// Full scan on open: rebuilds the global byte total, the max sequence, and
+    /// the per-mailbox `(count, bytes)` index.
     fn scan_totals(&self) -> anyhow::Result<(usize, u64)> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(ENVELOPES)?;
         let mut total = 0usize;
         let mut max_seq = 0u64;
         for entry in table.iter()? {
-            let (_, v) = entry?;
+            let (k, v) = entry?;
             if let Ok(val) = serde_json::from_slice::<StoredValue>(v.value()) {
                 total = total.saturating_add(val.c.len());
                 max_seq = max_seq.max(val.s);
+                if let Some(mailbox) = parse_mailbox(k.value()) {
+                    let mut e = self.index.entry(mailbox.to_string()).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.saturating_add(val.c.len());
+                }
             }
         }
         Ok((total, max_seq))
@@ -139,30 +156,33 @@ impl QueueStore {
         let value = StoredValue { t: env.envelope_type.clone(), c: env.ciphertext.clone(), q: now, s: seq };
         let value_bytes = serde_json::to_vec(&value)?;
 
-        // Snapshot the current mailbox contents to decide what to evict. Doing
-        // the decision outside the write txn keeps the txn short; the per-mailbox
-        // set is bounded by MAX_QUEUE_PER_RECIPIENT so this stays cheap.
-        let mut existing = self.read_mailbox(mailbox)?; // oldest-first
+        // Fast path: consult the per-mailbox index to see whether this envelope
+        // even risks tripping a cap. Only when it does do we read and deserialize
+        // the mailbox (oldest-first) to choose what to evict. The steady-state
+        // enqueue (mailbox under its caps) thus does no per-mailbox read at all,
+        // instead of paying an O(mailbox-size) deserialize on every message.
+        let (cur_count, cur_bytes) = self.index.get(mailbox).map(|e| *e).unwrap_or((0, 0));
+        let needs_eviction = cur_count + 1 > MAX_QUEUE_PER_RECIPIENT
+            || cur_bytes + incoming_len > PER_MAILBOX_QUEUE_BYTES;
+
         let mut evict_bytes = 0usize;
         let mut evict_ids: Vec<Uuid> = Vec::new();
-
-        let mut cur_count = existing.len();
-        let mut cur_bytes: usize = existing.iter().map(|(_, v)| v.c.len()).sum();
-
-        // Evict oldest until the new envelope fits within both limits.
-        let mut idx = 0;
-        while (cur_count + 1 > MAX_QUEUE_PER_RECIPIENT
-            || cur_bytes + incoming_len > PER_MAILBOX_QUEUE_BYTES)
-            && idx < existing.len()
-        {
-            let (id, v) = &existing[idx];
-            evict_ids.push(*id);
-            evict_bytes = evict_bytes.saturating_add(v.c.len());
-            cur_count -= 1;
-            cur_bytes -= v.c.len();
-            idx += 1;
+        if needs_eviction {
+            let existing = self.read_mailbox(mailbox)?; // oldest-first, only when needed
+            let mut c = existing.len();
+            let mut b: usize = existing.iter().map(|(_, v)| v.c.len()).sum();
+            let mut idx = 0;
+            while (c + 1 > MAX_QUEUE_PER_RECIPIENT || b + incoming_len > PER_MAILBOX_QUEUE_BYTES)
+                && idx < existing.len()
+            {
+                let (id, v) = &existing[idx];
+                evict_ids.push(*id);
+                evict_bytes = evict_bytes.saturating_add(v.c.len());
+                c -= 1;
+                b -= v.c.len();
+                idx += 1;
+            }
         }
-        existing.clear();
 
         let txn = self.db.begin_write()?;
         {
@@ -178,6 +198,13 @@ impl QueueStore {
         // per-mailbox byte limit is <= the global cap by construction).
         self.total_bytes.fetch_add(incoming_len, Ordering::Relaxed);
         crate::util::atomic_sub_saturating(&self.total_bytes, evict_bytes);
+        // Mirror the change into the per-mailbox index: +1/+incoming, minus what
+        // was evicted. Saturating so any drift can never underflow.
+        {
+            let mut e = self.index.entry(mailbox.to_string()).or_insert((0, 0));
+            e.0 = e.0.saturating_sub(evict_ids.len()).saturating_add(1);
+            e.1 = e.1.saturating_sub(evict_bytes).saturating_add(incoming_len);
+        }
         Ok(evict_ids.len())
     }
 
@@ -226,6 +253,12 @@ impl QueueStore {
         }
         txn.commit()?;
         crate::util::atomic_sub_saturating(&self.total_bytes, freed);
+        if removed > 0 {
+            if let Some(mut e) = self.index.get_mut(mailbox) {
+                e.0 = e.0.saturating_sub(removed);
+                e.1 = e.1.saturating_sub(freed);
+            }
+        }
         Ok(removed)
     }
 
@@ -250,6 +283,7 @@ impl QueueStore {
         }
         txn.commit()?;
         crate::util::atomic_sub_saturating(&self.total_bytes, freed);
+        self.index.remove(mailbox);
         Ok(keys.len())
     }
 
@@ -259,6 +293,9 @@ impl QueueStore {
         let cutoff = now_ms().saturating_sub(QUEUE_TTL_MS);
         let mut freed = 0usize;
         let mut keys: Vec<String> = Vec::new();
+        // Per-mailbox (count, bytes) removed, so the index can be decremented
+        // accurately after the sweep without a second full scan.
+        let mut per_mailbox: HashMap<String, (usize, usize)> = HashMap::new();
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(ENVELOPES)?;
@@ -267,6 +304,11 @@ impl QueueStore {
                 if let Ok(val) = serde_json::from_slice::<StoredValue>(v.value()) {
                     if val.q < cutoff {
                         freed = freed.saturating_add(val.c.len());
+                        if let Some(mailbox) = parse_mailbox(k.value()) {
+                            let e = per_mailbox.entry(mailbox.to_string()).or_insert((0, 0));
+                            e.0 += 1;
+                            e.1 = e.1.saturating_add(val.c.len());
+                        }
                         keys.push(k.value().to_string());
                     }
                 }
@@ -277,8 +319,19 @@ impl QueueStore {
         }
         txn.commit()?;
         crate::util::atomic_sub_saturating(&self.total_bytes, freed);
+        for (mailbox, (count, bytes)) in per_mailbox {
+            if let Some(mut e) = self.index.get_mut(&mailbox) {
+                e.0 = e.0.saturating_sub(count);
+                e.1 = e.1.saturating_sub(bytes);
+            }
+        }
         Ok(keys.len())
     }
+}
+
+/// Extract the mailbox portion of a `"<mailbox>:<uuid>"` key.
+fn parse_mailbox(key: &str) -> Option<&str> {
+    key.split_once(':').map(|(mailbox, _)| mailbox)
 }
 
 fn parse_id(key: &str) -> Option<Uuid> {
@@ -301,7 +354,8 @@ mod tests {
 
     fn temp_db() -> (tempfile::TempDir, QueueStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = QueueStore::open(&dir.path().join("queues.redb")).unwrap();
+        let db = Arc::new(Database::create(dir.path().join("queues.redb")).unwrap());
+        let store = QueueStore::new(db).unwrap();
         (dir, store)
     }
 
@@ -359,12 +413,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queues.redb");
         {
-            let store = QueueStore::open(&path).unwrap();
+            let db = Arc::new(Database::create(&path).unwrap());
+            let store = QueueStore::new(db).unwrap();
             store.enqueue("mbx_t_0000000000000", &env("mbx_t_0000000000000", "abcde")).unwrap();
             assert_eq!(store.total_bytes(), 5);
         }
         // Reopen: total is rebuilt by scanning the persisted db.
-        let store = QueueStore::open(&path).unwrap();
+        let db = Arc::new(Database::create(&path).unwrap());
+        let store = QueueStore::new(db).unwrap();
         assert_eq!(store.total_bytes(), 5);
         assert_eq!(store.flush("mbx_t_0000000000000").unwrap().len(), 1);
     }

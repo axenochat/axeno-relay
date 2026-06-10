@@ -73,6 +73,14 @@ The relay's private keys are always encrypted at rest in `relay-state.json`; the
 
 The `relay-key` fallback means a fresh install is never insecure by default, but it only helps if `relay-state.json` leaks on its own — it does not protect against theft of the whole data directory. For real protection, set `AXENO_KEY` or `AXENO_KEY_FILE` and keep the secret outside the data directory.
 
+If you set `AXENO_KEY` yourself, **use a high-entropy value** (e.g. `openssl rand -hex 32`). The at-rest wrapping derives its key from this secret with Argon2id at moderate cost parameters, which is appropriate for a random 256-bit secret but is *not* sufficient to protect a short or guessable passphrase against an attacker who has stolen `relay-state.json`. Treat `AXENO_KEY` as a key, not a password.
+
+## Capacity and scaling
+
+A relay's practical ceiling is **the Tor daemon, not the Rust process**. Every client holds one long-lived rendezvous circuit per contact-route it talks to on your relay, so total inbound circuits ≈ Σ(users × their contacts here). A stock `tor` comfortably handles low thousands of concurrent rendezvous circuits, which in practice means **a few hundred active users per relay**. This is by design: Axeno is meant to be self-hosted and federated across many small relays, not centralized on one big one. If you expect to exceed that, plan for multiple relays (and eventually Onionbalance) rather than a single instance.
+
+The relay itself is bounded everywhere (mailbox, bundle, queue, and connection caps in `config.rs`) and persists durably, but durability costs disk fsyncs on the send path, so very high message throughput is ultimately gated by your storage. SSD-backed storage is strongly recommended.
+
 ### Run behind Tor
 
 Clients should reach the relay through its `.onion` address. When the relay binds to a loopback address and `tor` is installed, it starts a v3 hidden service automatically and writes the address to `onion_address.txt`. Distribute that address to your users.
@@ -93,6 +101,11 @@ The relay does not protect against:
 - A compromised relay host. The hardening above reduces but does not eliminate this risk.
 - Global traffic analysis. The relay is not a mixnet and can correlate messages by timing and size.
 - Loss of availability. The relay is a single point of trust for delivery, though never for confidentiality.
+
+It is also worth understanding two deliberate trade-offs:
+
+- **Trust on first use (TOFU).** A client pins your relay's trust root the first time it connects and refuses to continue if it ever changes. This detects a later swap, but the very first connection is trusted implicitly — distribute the `.onion` address over a channel you trust.
+- **Mailbox reclamation.** Mailboxes idle for 30 days with an empty queue and no live socket are garbage-collected (proof-of-work gates creation, not lifetime). After a mailbox is collected, its random id becomes free, so a party who knows that id could register it with their own auth token. They would only ever receive sealed ciphertext they cannot decrypt, and the original owner is locked out (their auth no longer matches) rather than impersonated — but it is a possible nuisance/denial vector against a long-abandoned mailbox. Active mailboxes refresh their lease on every Hello and inbound send and are never collected.
 
 ## License
 

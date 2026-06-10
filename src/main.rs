@@ -25,6 +25,7 @@
 //! - `util`        — time, hashing, validation, proof-of-work.
 
 mod config;
+mod meta_store;
 mod persistence;
 mod protocol;
 mod queue_store;
@@ -34,14 +35,16 @@ mod update_check;
 mod util;
 mod ws;
 
-use std::{fs, net::SocketAddr, path::PathBuf, sync::atomic::Ordering, sync::Arc, time::Duration};
+use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{routing::get, Router};
+use redb::Database;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::config::{MAILBOX_GC_INTERVAL_SECS, QUEUE_SWEEP_INTERVAL_SECS};
-use crate::persistence::{init_server_crypto, load_disk_state, prune_disk_state, save_disk_state, snapshot_disk_state};
+use crate::config::{MAILBOX_GC_INTERVAL_SECS, META_FLUSH_INTERVAL_SECS, QUEUE_SWEEP_INTERVAL_SECS};
+use crate::meta_store::MetaStore;
+use crate::persistence::{init_server_crypto, load_disk_state, persist_crypto, prune_disk_state};
 use crate::queue_store::QueueStore;
 use crate::state::AppState;
 use crate::tor::start_tor_hidden_service;
@@ -72,10 +75,15 @@ async fn main() -> anyhow::Result<()> {
     let crypto = init_server_crypto(&mut disk)?;
     prune_disk_state(&mut disk);
 
-    // Disk-backed offline queues. Opened before save so a one-time migration of
-    // any legacy in-JSON queues lands in the store and is then dropped from the
-    // JSON snapshot.
-    let queues = Arc::new(QueueStore::open(&data_dir.join("queues.redb"))?);
+    // All durable runtime state — offline queues, mailbox auth, and invite
+    // bundles — shares one redb database. Opened before the crypto is persisted
+    // so any legacy in-JSON state migrates into the stores first; the JSON file
+    // is then rewritten with only the encrypted signing keys.
+    let db = Arc::new(Database::create(data_dir.join("queues.redb"))?);
+    let queues = Arc::new(QueueStore::new(db.clone())?);
+    let meta = Arc::new(MetaStore::new(db.clone())?);
+
+    // One-time migration of legacy in-JSON offline queues.
     let legacy_queued: usize = disk.queues.iter().map(|(_, v)| v.len()).sum();
     if legacy_queued > 0 {
         for (rid, envs) in &disk.queues {
@@ -83,12 +91,30 @@ async fn main() -> anyhow::Result<()> {
         }
         info!(migrated = legacy_queued, "migrated legacy in-JSON offline queues into the disk-backed store");
     }
-    disk.queues.clear();
-    save_disk_state(&data_dir, &disk)?;
+    // One-time migration of legacy in-JSON mailbox auth and invite bundles.
+    if meta.auth_is_empty()? && !disk.mailbox_auth.is_empty() {
+        let batch: Vec<_> = disk.mailbox_auth.iter().cloned().map(|(k, v)| (k, Some(v))).collect();
+        let n = batch.len();
+        meta.flush_auth(&batch)?;
+        info!(migrated = n, "migrated legacy in-JSON mailbox auth into the disk-backed store");
+    }
+    if meta.bundles_is_empty()? && !disk.bundles.is_empty() {
+        let batch: Vec<_> = disk.bundles.iter().cloned().map(|b| (b.id.clone(), Some(b))).collect();
+        let n = batch.len();
+        meta.flush_bundles(&batch)?;
+        info!(migrated = n, "migrated legacy in-JSON invite bundles into the disk-backed store");
+    }
 
-    let state = AppState::build(&disk, data_dir.clone(), crypto, queues);
+    // Persist the signing keys, encrypted, exactly once. This also rewrites the
+    // JSON file without the now-migrated auth/queue/bundle data, and (unlike the
+    // old flow) writes the keys encrypted from the very first save so private
+    // keys never land on disk in the clear.
+    let disk_crypto = disk.crypto.clone().expect("crypto initialized by init_server_crypto");
+    persist_crypto(&data_dir, &disk_crypto)?;
 
-    spawn_persistence_task(state.clone());
+    let state = AppState::build(meta, queues, crypto)?;
+
+    spawn_meta_flush_task(state.clone());
     spawn_mailbox_gc_task(state.clone());
     spawn_queue_sweep_task(state.clone());
 
@@ -113,19 +139,19 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Periodically flush dirty runtime state to disk off the request path.
-fn spawn_persistence_task(state: AppState) {
+/// Periodically write-back dirty mailbox-auth / invite-bundle entries to the
+/// durable store, off the request path. Only the keys that changed since the
+/// last flush are written, so persistence cost scales with churn rather than
+/// total mailbox count.
+fn spawn_meta_flush_task(state: AppState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(META_FLUSH_INTERVAL_SECS));
         loop {
             interval.tick().await;
-            if state.dirty.swap(false, Ordering::Relaxed) {
-                if let Ok(disk) = snapshot_disk_state(&state) {
-                    let data_dir = state.data_dir.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        let _ = save_disk_state(&data_dir, &disk);
-                    }).await;
-                }
+            if state.dirty_auth.is_empty() && state.dirty_bundles.is_empty() { continue; }
+            let s = state.clone();
+            if let Ok(Err(e)) = tokio::task::spawn_blocking(move || s.flush_dirty_meta()).await {
+                warn!("meta flush failed: {e}");
             }
         }
     });

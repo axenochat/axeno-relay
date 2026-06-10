@@ -282,29 +282,23 @@ pub(crate) fn prune_disk_state(disk: &mut DiskState) {
     }
 }
 
-pub(crate) fn snapshot_disk_state(state: &crate::state::AppState) -> anyhow::Result<DiskState> {
-    // Build entirely from in-memory state. The crypto key material is cached
-    // at startup in state.disk_crypto and never mutated, so we do not need to
-    // re-read the disk file. Re-reading could silently introduce corrupted or
-    // externally modified key material while overwriting the auth/queue data.
-    let disk_crypto = (*state.disk_crypto).clone();
-    let mut disk = DiskState {
+/// Persist the relay's signing keys, encrypted at rest, to `relay-state.json`.
+///
+/// This is written exactly once at startup. The keys never change after
+/// initialization, and the runtime mailbox-auth / bundle / queue state now lives
+/// in the durable redb stores, so there is no longer any periodic full-state
+/// JSON rewrite. The plaintext `crypto` field is always left `None` so private
+/// keys never touch disk in the clear, regardless of whether `AXENO_KEY` is set.
+pub(crate) fn persist_crypto(data_dir: &Path, disk_crypto: &DiskCrypto) -> anyhow::Result<()> {
+    let env_key = relay_encryption_key(data_dir)?;
+    let disk = DiskState {
         crypto: None,
-        encrypted_crypto: None,
-        mailbox_auth: state.mailbox_auth.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect(),
-        // Offline queues live in the disk-backed QueueStore now, not in this JSON
-        // snapshot. The field stays only to migrate any legacy state on load.
+        encrypted_crypto: Some(encrypt_disk_crypto(disk_crypto, &env_key)?),
+        // Legacy fields are written empty: their contents have already been
+        // migrated into the redb stores by the time this runs.
+        mailbox_auth: Vec::new(),
         queues: Vec::new(),
-        bundles: state.bundles.iter().map(|entry| entry.value().clone()).collect(),
+        bundles: Vec::new(),
     };
-
-    // Always encrypt the private keys before writing to disk. The plaintext
-    // crypto field is left None so private keys never hit disk in the clear,
-    // regardless of whether AXENO_KEY is set (a local relay-key file backs the
-    // default case).
-    let env_key = relay_encryption_key(state.data_dir.as_path())?;
-    disk.encrypted_crypto = Some(encrypt_disk_crypto(&disk_crypto, &env_key)?);
-
-    prune_disk_state(&mut disk);
-    Ok(disk)
+    save_disk_state(data_dir, &disk)
 }

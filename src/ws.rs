@@ -30,6 +30,19 @@ pub(crate) async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppStat
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
+    // Global connection cap: a backstop against a connection flood exhausting
+    // file descriptors and per-socket task/channel memory. Reserve a slot up
+    // front and release it on every exit path via the guard.
+    if state.conn_count.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+        state.conn_count.fetch_sub(1, Ordering::Relaxed);
+        return;
+    }
+    struct ConnGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ConnGuard {
+        fn drop(&mut self) { self.0.fetch_sub(1, Ordering::Relaxed); }
+    }
+    let _conn_guard = ConnGuard(state.conn_count.clone());
+
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_CAPACITY);
 
@@ -46,7 +59,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut window_start_ms = now_ms();
     let mut frame_count: u32 = 0;
 
-    while let Some(incoming) = receiver.next().await {
+    let idle_timeout = std::time::Duration::from_secs(SOCKET_IDLE_TIMEOUT_SECS);
+    loop {
+        let incoming = match tokio::time::timeout(idle_timeout, receiver.next()).await {
+            Ok(Some(incoming)) => incoming,
+            // Stream closed by peer, or no frame within the idle window: drop the
+            // socket so idle/slowloris connections cannot pin relay resources.
+            Ok(None) | Err(_) => break,
+        };
         let Ok(msg) = incoming else { break; };
         let Message::Text(text) = msg else { continue; };
         let now = now_ms();
@@ -102,7 +122,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         true
                     }
                 };
-                if changed { state.mark_dirty(); }
+                let _ = changed;
+                // last_active_ms (and possibly the delivery-hash set) changed on
+                // this Hello; persist the auth entry on the next meta flush.
+                state.mark_auth_dirty(&rid);
                 recipient_id = Some(rid.clone());
                 let _ = tx.try_send(ServerFrame::HelloOk {
                     protocol_version: selected,
@@ -116,8 +139,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let store = state.queues.clone();
                     let rid_for_flush = rid.clone();
                     if let Ok(Ok(envs)) = tokio::task::spawn_blocking(move || store.flush(&rid_for_flush)).await {
+                        // Use the awaited `send` rather than `try_send`: a large
+                        // offline backlog easily exceeds the 256-slot outbound
+                        // channel, and a slow Tor writer drains it gradually. With
+                        // `try_send` the flush would stop at ~256 envelopes and the
+                        // rest would sit queued until the next reconnect (which the
+                        // client has no reason to trigger). Awaiting applies
+                        // backpressure so the whole backlog is delivered. The writer
+                        // task drains `rx` concurrently, so this cannot deadlock; a
+                        // dead socket surfaces as a send error and ends the flush.
                         for env in envs {
-                            if tx.try_send(ServerFrame::Envelope { envelope: env }).is_err() { break; }
+                            if tx.send(ServerFrame::Envelope { envelope: env }).await.is_err() { break; }
                         }
                     }
                 }
@@ -132,7 +164,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     auth.replace_delivery_hashes(tokens.iter().map(|t| token_hash(t)).collect());
                     let active_count = auth.delivery_token_hashes.len();
                     drop(auth);
-                    state.mark_dirty();
+                    state.mark_auth_dirty(rid);
                     let _ = tx.try_send(ServerFrame::DeliveryTokensSet { request_id, active_count });
                 } else {
                     let _ = tx.try_send(err("not_registered", "mailbox auth missing"));
@@ -222,7 +254,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     .and_then(|r| r.ok())
                     .is_some();
                 // Persist the destination mailbox's refreshed activity lease.
-                state.mark_dirty();
+                state.mark_auth_dirty(&to);
                 if enqueued || delivered_live {
                     let _ = tx.try_send(ServerFrame::SendOk { id: env_id, queued: !delivered_live, client_ref });
                 } else {
@@ -259,16 +291,20 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     atomic_sub_saturating(&state.total_bundle_bytes, old.ciphertext.len());
                 }
                 state.total_bundle_bytes.fetch_add(bundle_len, Ordering::Relaxed);
-                state.mark_dirty();
+                state.mark_bundle_dirty(&bundle_id);
                 let _ = tx.try_send(ServerFrame::BundleUploaded { request_id, bundle_id, expires_at_ms: expires });
             }
             ClientFrame::FetchBundle { request_id, bundle_id } => {
                 state.prune_expired_bundles();
+                // Expired-bundle pruning is rate-limited, so an entry may still be
+                // present past its expiry between scans; check expiry explicitly so
+                // a fetch never returns an expired bundle.
+                let now = now_ms();
                 match state.bundles.get(&bundle_id) {
-                    Some(bundle) => {
+                    Some(bundle) if bundle.expires_at_ms > now => {
                         let _ = tx.try_send(ServerFrame::Bundle { request_id, bundle_id: bundle.id.clone(), ciphertext: bundle.ciphertext.clone(), expires_at_ms: bundle.expires_at_ms });
                     }
-                    None => { let _ = tx.try_send(err("bundle_not_found", "invite bundle was not found or has expired")); }
+                    _ => { let _ = tx.try_send(err("bundle_not_found", "invite bundle was not found or has expired")); }
                 }
             }
             ClientFrame::Ack { ids } => {
@@ -289,7 +325,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let _ = tokio::task::spawn_blocking(move || store.purge_mailbox(&rid_c)).await;
                 state.send_rate.remove(rid);
                 state.online.remove(rid);
-                state.mark_dirty();
+                state.mark_auth_dirty(rid);
                 let _ = tx.try_send(ServerFrame::AckOk { removed: 0 });
                 break;
             }
