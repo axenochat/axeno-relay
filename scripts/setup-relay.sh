@@ -11,6 +11,7 @@
 #
 # Flags:
 #   --no-service     set up the binary + config but do not install a service
+#   --reset          remove any existing relay state and at-rest key, then set up fresh
 #   --yes, -y        assume "yes" to prompts (non-interactive)
 #   --bind ADDR      listen address (default 127.0.0.1:8787; loopback enables Tor)
 #   --help, -h       show this help
@@ -21,9 +22,11 @@ set -euo pipefail
 
 # Repository that publishes releases. Update this if the project moves to an org.
 REPO="axenochat/axeno-relay"
+RAW_URL="https://raw.githubusercontent.com/${REPO}/main/scripts/setup-relay.sh"
 
 ASSUME_YES=0
 INSTALL_SERVICE=1
+RESET=0
 BIND_ADDR="127.0.0.1:8787"
 
 c_red=$'\033[31m'; c_yellow=$'\033[33m'; c_green=$'\033[32m'; c_dim=$'\033[2m'; c_reset=$'\033[0m'
@@ -32,11 +35,12 @@ warn()  { printf '%sWARN:%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
 err()   { printf '%sERROR:%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,/^set /p' "$0" | sed '/^set /d; s/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-service) INSTALL_SERVICE=0 ;;
+    --reset)      RESET=1 ;;
     -y|--yes)     ASSUME_YES=1 ;;
     --bind)       BIND_ADDR="${2:?--bind needs an address}"; shift ;;
     -h|--help)    usage ;;
@@ -97,7 +101,7 @@ JfY/tFEOiAK8gYrPeZHQADqowZqRCy4OEDe6fUC8wACBAgMBAAE=
 -----END PUBLIC KEY-----'
 
 if [ "$PLATFORM" != linux ]; then
-  warn "Running a relay on ${OS} is not recommended for production — Linux is strongly advised."
+  warn "Running a relay on ${OS} is not recommended for production. Linux is strongly advised."
   confirm "Continue anyway?" n || die "aborted"
 fi
 
@@ -108,16 +112,48 @@ gen_key() {
   else head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
 }
 
-# Ensure the 'tor' binary is present. The relay publishes its .onion address by
+# Print the path to the tor binary, checking PATH plus the standard Homebrew
+# locations (root's PATH does not include Homebrew). Returns 1 if not found.
+tor_path() {
+  if command -v tor >/dev/null 2>&1; then command -v tor; return 0; fi
+  local t
+  for t in /opt/homebrew/bin/tor /usr/local/bin/tor; do
+    [ -x "$t" ] && { printf '%s\n' "$t"; return 0; }
+  done
+  return 1
+}
+
+# Ensure the tor binary is present. The relay publishes its .onion address by
 # spawning tor at startup, so without tor a freshly installed service runs but is
-# unreachable — the single most confusing failure mode of this script. On Linux
-# we install it automatically with the system package manager (the service path
-# already has root). macOS can't: Homebrew refuses to run as root, so we return
-# failure and the caller prints the one command to run by hand. Returns 0 if tor
-# is available afterward, 1 otherwise.
+# unreachable, which is the most confusing failure mode of this script.
+#
+# Linux: install it with the system package manager (the service path has root).
+# macOS: Homebrew refuses to run as root, so install it as the user who invoked
+# sudo. Returns 0 if tor is available afterward, 1 otherwise.
 ensure_tor() {
-  if command -v tor >/dev/null; then return 0; fi
-  if [ "$PLATFORM" = macos ]; then return 1; fi
+  if tor_path >/dev/null; then return 0; fi
+
+  if [ "$PLATFORM" = macos ]; then
+    local brew="" b
+    for b in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+      [ -x "$b" ] && { brew="$b"; break; }
+    done
+    [ -z "$brew" ] && brew="$(command -v brew 2>/dev/null || true)"
+    if [ -z "$brew" ]; then
+      warn "Homebrew was not found; cannot install Tor automatically."
+      return 1
+    fi
+    if [ -z "${SUDO_USER:-}" ] || [ "$SUDO_USER" = root ]; then
+      warn "Cannot install Tor: Homebrew will not run as root and no invoking user was found."
+      warn "Run this script with sudo from your normal account, or 'brew install tor' yourself."
+      return 1
+    fi
+    info "Installing Tor via Homebrew (as $SUDO_USER) ..."
+    sudo -u "$SUDO_USER" "$brew" install tor || true
+    tor_path >/dev/null
+    return $?
+  fi
+
   info "Installing Tor (required to publish the relay's .onion address) ..."
   if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y tor
   elif command -v dnf     >/dev/null; then dnf install -y tor
@@ -144,7 +180,7 @@ wait_for_onion() {
     info "Relay address (share this with the people who will use it):"
     printf '\n    %s%s%s\n\n' "$c_green" "$onion" "$c_reset"
   else
-    warn "Not published yet — check again shortly with:  sudo cat $file"
+    warn "Not published yet. Check again shortly with:  sudo cat $file"
   fi
 }
 
@@ -167,11 +203,11 @@ curl -fSL --proto '=https' --tlsv1.2 "$SIG_URL" -o "$TMP/SHA256SUMS.sig" \
 printf '%s\n' "$RELEASE_PUBKEY_PEM" > "$TMP/relay.pub"
 openssl dgst -sha256 -verify "$TMP/relay.pub" \
   -signature "$TMP/SHA256SUMS.sig" "$TMP/SHA256SUMS" >/dev/null 2>&1 \
-  || die "SHA256SUMS signature is INVALID — refusing to install a possibly tampered binary."
+  || die "SHA256SUMS signature is INVALID. Refusing to install a possibly tampered binary."
 want="$(awk -v f="$ASSET" '$2 == f {print $1}' "$TMP/SHA256SUMS")"
 [ -n "$want" ] || die "no checksum entry for $ASSET in the signed SHA256SUMS."
 got="$(openssl dgst -sha256 "$TMP/relay.tar.gz" | awk '{print $NF}')"
-[ "$want" = "$got" ] || die "checksum mismatch for $ASSET (signed $want, got $got) — aborting."
+[ "$want" = "$got" ] || die "checksum mismatch for $ASSET (signed $want, got $got); aborting."
 info "Signature and checksum verified."
 
 tar -xzf "$TMP/relay.tar.gz" -C "$TMP"
@@ -212,7 +248,7 @@ if [ "$INSTALL_SERVICE" = 0 ]; then
   info "  1. Start it:  cd '$DEST' && ./axeno-relay"
   info "  2. Wait ~30-90s, then read your address:  cat '$DEST/axeno-relay-data/onion_address.txt'"
   info "  3. Share that ws://...onion/ws address; add it in the Axeno desktop app (Settings)."
-  info "The .env holds your at-rest key — back it up and keep it private."
+  info "The .env holds your at-rest key. Back it up and keep it private."
   exit 0
 fi
 
@@ -231,6 +267,12 @@ if [ "$PLATFORM" = linux ]; then
   # allocated per start) plus a strict sandbox. The at-rest key lives in a
   # root-only EnvironmentFile that the service user never sees.
   # ---------------------------------------------------------------------
+  if [ "$RESET" = 1 ]; then
+    warn "Reset requested: stopping the service and removing the existing key and state."
+    systemctl stop axeno-relay.service 2>/dev/null || true
+    rm -f /etc/axeno/relay.env
+    rm -rf /var/lib/axeno /var/lib/private/axeno
+  fi
   ENV_DIR=/etc/axeno
   ENV_FILE="$ENV_DIR/relay.env"
   install -d -m 0750 "$ENV_DIR"
@@ -305,6 +347,20 @@ UNIT_EOF
 
   systemctl daemon-reload
   systemctl enable --now axeno-relay.service
+
+  # Confirm the relay actually stays up rather than reporting success and leaving
+  # a crash loop. The usual cause of an immediate failure is leftover state from
+  # an earlier install that was sealed under a different at-rest key.
+  sleep 3
+  if ! systemctl is-active --quiet axeno-relay.service; then
+    err "The relay started but is not staying up. Recent logs:"
+    journalctl -u axeno-relay -n 15 --no-pager >&2 || true
+    err ""
+    err "If the logs mention decrypting relay keys, leftover state from an earlier"
+    err "install is sealed under a different key. Re-run with --reset to wipe it:"
+    err "  curl -fsSL $RAW_URL | sudo bash -s -- --reset"
+    exit 1
+  fi
   info "Service installed and started (DynamicUser, sandboxed)."
 
   if [ "$TOR_OK" = 1 ]; then
@@ -329,6 +385,13 @@ else
   SVC_USER=_axeno
   DATA=/usr/local/var/axeno
   PLIST=/Library/LaunchDaemons/com.axeno.relay.plist
+
+  if [ "$RESET" = 1 ]; then
+    warn "Reset requested: stopping the service and removing the existing key and state."
+    launchctl unload "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    rm -rf "$DATA"
+  fi
 
   if ! dscl . -read "/Users/$SVC_USER" >/dev/null 2>&1; then
     # Find a free UID in the system range (200-400).
@@ -356,6 +419,18 @@ else
     KEY="$(gen_key)"
   fi
 
+  # Install Tor (as the user who ran sudo, since Homebrew refuses to run as root)
+  # and capture its directory. launchd gives daemons a minimal PATH that excludes
+  # Homebrew, so the relay running as _axeno would not otherwise find tor.
+  TOR_OK=0; TOR_DIR=""
+  if ensure_tor; then
+    TOR_OK=1; TOR_DIR="$(dirname "$(tor_path)")"
+  else
+    warn "Tor is not installed. Install it as your normal user (not root):  brew install tor"
+    warn "then restart the relay:  sudo launchctl kickstart -k system/com.axeno.relay"
+  fi
+  SVC_PATH="${TOR_DIR:+$TOR_DIR:}/usr/bin:/bin:/usr/sbin:/sbin"
+
   cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -370,6 +445,7 @@ else
     <key>AXENO_KEY</key><string>${KEY}</string>
     <key>AXENO_BIND</key><string>${BIND_ADDR}</string>
     <key>AXENO_DATA_DIR</key><string>${DATA}</string>
+    <key>PATH</key><string>${SVC_PATH}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -381,20 +457,23 @@ PLIST_EOF
   chmod 600 "$PLIST"   # root-only: protects AXENO_KEY in the plist
   chown root:wheel "$PLIST"
 
-  # Homebrew refuses to run as root, so tor can't be auto-installed here. Flag it
-  # plainly — without tor the relay starts but never publishes a .onion.
-  TOR_OK=0
-  if command -v tor >/dev/null; then
-    TOR_OK=1
-  else
-    warn "Tor is not installed. Install it as your normal user (not root):  brew install tor"
-    warn "Then restart the relay:  sudo launchctl kickstart -k system/com.axeno.relay"
-  fi
-
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
   info "LaunchDaemon installed and started as user $SVC_USER."
   warn "The AXENO_KEY is stored in $PLIST (root-only). Back it up."
+
+  # Confirm it stays up. A nonzero last-exit usually means leftover state from an
+  # earlier install sealed under a different at-rest key.
+  sleep 3
+  svc_status="$(launchctl list com.axeno.relay 2>/dev/null | sed -n 's/.*"LastExitStatus" = \([0-9-]*\);.*/\1/p')"
+  if [ -n "$svc_status" ] && [ "$svc_status" != 0 ]; then
+    err "The relay exited with status $svc_status. Recent log:"
+    tail -n 15 /var/log/axeno-relay.log >&2 2>/dev/null || true
+    err ""
+    err "If this mentions decrypting relay keys, leftover state is sealed under a"
+    err "different key. Re-run with --reset to wipe it and start fresh."
+    exit 1
+  fi
 
   if [ "$TOR_OK" = 1 ]; then
     wait_for_onion "${DATA}/onion_address.txt"

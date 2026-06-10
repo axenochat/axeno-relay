@@ -6,17 +6,17 @@ The Axeno relay is the message broker for [Axeno](https://github.com/axenochat/a
 
 ## What the relay does
 
-The relay is an **untrusted** message broker. It stores sealed envelopes for offline recipients, routes live delivery, issues short-lived sealed-sender certificates, and hosts encrypted invite bundles. It never sees plaintext. The only things it can observe are transport metadata: which mailbox a connection authenticates as, the destination mailbox of a message, ciphertext size, and timing.
+The relay is an **untrusted** message broker. It stores sealed envelopes for offline recipients, routes live delivery, issues short-lived sealed-sender certificates, and hosts encrypted invite bundles. It never sees plaintext. The only things it can observe are transport metadata: which mailbox a connection authenticates as, the destination mailbox of a message, the ciphertext size, and timing.
 
 Each contact gets a dedicated mailbox with its own tokens and sealed-sender key, so the relay cannot link your contacts to one another.
 
 ## Run a relay
 
-**Linux is strongly recommended for a production relay.** macOS and Windows are supported for testing.
+**Linux is recommended for a production relay.** macOS and Windows work and are intended for testing.
 
 ### Quick setup (recommended)
 
-The setup script downloads the prebuilt relay binary, generates the at-rest key, installs Tor if it is missing (Linux), and installs the relay as a hardened, auto-starting service running under its own isolated account. Run in a terminal it prompts before installing the service; piped from `curl` there is no terminal to prompt on, so it proceeds with the defaults (service install). Pass `--no-service` (bash) / `-NoService` (PowerShell) for a local, non-service setup instead.
+The setup script downloads the prebuilt relay binary, generates the at-rest key, installs Tor if it is missing (Linux and macOS), and installs the relay as a hardened, auto-starting service under its own isolated account. In a terminal it asks before installing the service. Piped from `curl` there is no terminal to prompt on, so it uses the defaults and installs the service. Pass `--no-service` (bash) or `-NoService` (PowerShell) for a local setup without a service.
 
 Linux / macOS:
 
@@ -32,13 +32,15 @@ irm https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-r
 
 Before running anything, both scripts verify the download against a `SHA256SUMS` manifest signed with the project's release key (the public key is pinned inside each script), and abort if the signature or checksum does not match. HTTPS alone is not trusted.
 
-On Linux the relay runs under a sandboxed systemd unit with `DynamicUser`; on macOS under a dedicated `_axeno` LaunchDaemon user; on Windows as a scheduled task under the low-privilege `LOCAL SERVICE` account. Pass `--no-service` (bash) or `-NoService` (PowerShell) to set up the binary and config without a service.
+The service runs under an isolated account: a systemd `DynamicUser` on Linux, a dedicated `_axeno` LaunchDaemon user on macOS, and the low-privilege `LOCAL SERVICE` account on Windows.
 
-On first start the relay generates its keys and publishes a Tor v3 hidden service, writing the `ws://….onion/ws` address to `onion_address.txt` in the data directory. The setup script waits for this and prints the address (first-run Tor bootstrap takes ~30–90s); afterwards you can read it with `sudo cat /var/lib/axeno/onion_address.txt`. Share that address with the people who will use your relay — in the desktop app they add it under **Settings**.
+On first start the relay generates its keys and publishes a Tor v3 hidden service, writing the `ws://<id>.onion/ws` address to `onion_address.txt` in the data directory. The setup script waits for it and prints it; the first Tor bootstrap takes about 30 to 90 seconds. You can read it again later with `sudo cat /var/lib/axeno/onion_address.txt` on Linux, or from the data directory the script prints on macOS and Windows. Give that address to the people who will use your relay; in the desktop app they add it under **Settings**.
+
+The script is safe to re-run. If you have installed it several times and the relay no longer starts (the logs mention decrypting relay keys), the at-rest key and the encrypted state have fallen out of sync. Re-run with `--reset` (bash) or `-Reset` (PowerShell) to remove the old key and state and set up fresh. This discards the relay's identity and any queued messages, so contacts pair again.
 
 ### Manual setup
 
-Requirements: Rust stable ([rustup](https://rustup.rs)), `protoc` (`apt install protobuf-compiler` / `brew install protobuf`), and the `tor` binary on your `PATH` to publish a hidden service.
+Requirements: Rust stable ([rustup](https://rustup.rs)), `protoc` (`apt install protobuf-compiler`, `brew install protobuf`), and the `tor` binary on your `PATH` to publish a hidden service.
 
 ```bash
 cargo build --release
@@ -56,12 +58,12 @@ The relay is configured through environment variables. It also reads a `.env` fi
 | `AXENO_DATA_DIR` | `axeno-relay-data` | Directory for persisted state, the at-rest key fallback, and Tor data. |
 | `AXENO_KEY` | *(unset)* | Secret that encrypts the relay's private keys at rest. Recommended for any real deployment. |
 | `AXENO_KEY_FILE` | *(unset)* | Path to a file whose contents are the at-rest secret. Use this for Docker, Kubernetes, or Vault secret mounts so the secret never enters the process environment. |
-| `AXENO_UPDATE_CHECK` | *(unset)* | Set to `1` to let the relay check GitHub daily and log when a newer release exists. Off by default; when on, the relay contacts `api.github.com` over clearnet, revealing its IP. Notify-only — it never downloads or installs anything. |
+| `AXENO_UPDATE_CHECK` | *(unset)* | Set to `1` to let the relay check GitHub daily and log when a newer release exists. Off by default. When on, the relay contacts `api.github.com` over clearnet, which reveals its IP. It only logs; it never downloads or installs anything. |
 | `RUST_LOG` | *(unset)* | Standard `tracing` filter, for example `axeno_server=debug`. |
 
 ## Hardening
 
-The relay never sees message contents, but it holds two things worth protecting: its signing keys, which can mint sender certificates for any mailbox on the relay, and offline message queues. Run it like any other service that holds secrets. The setup script's service install applies a hardened profile by default.
+The relay never sees message contents, but it holds two things worth protecting: its signing keys, which can mint sender certificates for any mailbox on the relay, and the offline message queues. Run it like any other service that holds secrets. The setup script's service install applies a hardened profile by default.
 
 ### Encrypt the relay's keys at rest
 
@@ -71,15 +73,9 @@ The relay's private keys are always encrypted at rest in `relay-state.json`; the
 2. `AXENO_KEY_FILE`, a path whose file contents are the secret. The secret never enters the process environment, so it cannot leak through process inspection or child processes. Best for container and secrets-manager deployments.
 3. A randomly generated `relay-key` file (mode `0600`) created inside the data directory on first run.
 
-The `relay-key` fallback means a fresh install is never insecure by default, but it only helps if `relay-state.json` leaks on its own — it does not protect against theft of the whole data directory. For real protection, set `AXENO_KEY` or `AXENO_KEY_FILE` and keep the secret outside the data directory.
+The `relay-key` fallback means a fresh install is never insecure by default, but it only helps if `relay-state.json` leaks on its own. It does not protect against theft of the whole data directory. For real protection, set `AXENO_KEY` or `AXENO_KEY_FILE` and keep the secret outside the data directory.
 
-If you set `AXENO_KEY` yourself, **use a high-entropy value** (e.g. `openssl rand -hex 32`). The at-rest wrapping derives its key from this secret with Argon2id at moderate cost parameters, which is appropriate for a random 256-bit secret but is *not* sufficient to protect a short or guessable passphrase against an attacker who has stolen `relay-state.json`. Treat `AXENO_KEY` as a key, not a password.
-
-## Capacity and scaling
-
-A relay's practical ceiling is **the Tor daemon, not the Rust process**. Every client holds one long-lived rendezvous circuit per contact-route it talks to on your relay, so total inbound circuits ≈ Σ(users × their contacts here). A stock `tor` comfortably handles low thousands of concurrent rendezvous circuits, which in practice means **a few hundred active users per relay**. This is by design: Axeno is meant to be self-hosted and federated across many small relays, not centralized on one big one. If you expect to exceed that, plan for multiple relays (and eventually Onionbalance) rather than a single instance.
-
-The relay itself is bounded everywhere (mailbox, bundle, queue, and connection caps in `config.rs`) and persists durably, but durability costs disk fsyncs on the send path, so very high message throughput is ultimately gated by your storage. SSD-backed storage is strongly recommended.
+If you set `AXENO_KEY` yourself, **use a high-entropy value** such as `openssl rand -hex 32`. The at-rest wrapping derives its key from this secret with Argon2id at moderate cost parameters. That is appropriate for a random 256-bit secret but is not enough to protect a short or guessable passphrase against an attacker who has stolen `relay-state.json`. Treat `AXENO_KEY` as a key, not a password.
 
 ### Run behind Tor
 
@@ -94,6 +90,12 @@ Clients should reach the relay through its `.onion` address. When the relay bind
 
 Stop the relay, delete `relay-state.json`, the `relay-key` file, and the `tor` directory inside the data directory, then restart. The relay generates fresh keys and a new `.onion` address. Existing mailboxes and queues are dropped, and clients must pair again.
 
+## Capacity and scaling
+
+A relay's practical limit is the Tor daemon, not the relay process. Each client keeps one long-lived rendezvous circuit per contact route it uses on your relay, so the number of inbound circuits grows with the number of users times the contacts they have on this relay. A standard `tor` handles a few thousand concurrent rendezvous circuits, which works out to roughly a few hundred active users per relay. Axeno is built to be self-hosted and spread across many small relays rather than centralized on one large one. If you expect more load than that, run several relays (and look at Onionbalance) instead of scaling a single instance.
+
+The relay caps mailboxes, bundles, queues, and connections (see `config.rs`) and stores state durably. Durable writes cost disk fsyncs on the send path, so peak message throughput depends on your storage. Use an SSD.
+
 ## Security model
 
 The relay does not protect against:
@@ -102,10 +104,10 @@ The relay does not protect against:
 - Global traffic analysis. The relay is not a mixnet and can correlate messages by timing and size.
 - Loss of availability. The relay is a single point of trust for delivery, though never for confidentiality.
 
-It is also worth understanding two deliberate trade-offs:
+Two deliberate trade-offs are worth knowing about:
 
-- **Trust on first use (TOFU).** A client pins your relay's trust root the first time it connects and refuses to continue if it ever changes. This detects a later swap, but the very first connection is trusted implicitly — distribute the `.onion` address over a channel you trust.
-- **Mailbox reclamation.** Mailboxes idle for 30 days with an empty queue and no live socket are garbage-collected (proof-of-work gates creation, not lifetime). After a mailbox is collected, its random id becomes free, so a party who knows that id could register it with their own auth token. They would only ever receive sealed ciphertext they cannot decrypt, and the original owner is locked out (their auth no longer matches) rather than impersonated — but it is a possible nuisance/denial vector against a long-abandoned mailbox. Active mailboxes refresh their lease on every Hello and inbound send and are never collected.
+- **Trust on first use.** A client pins your relay's trust root on its first connection and refuses to continue if it later changes. This catches a later swap, but the first connection is trusted implicitly, so share the `.onion` address over a channel you trust.
+- **Mailbox reclamation.** A mailbox that sits idle for 30 days with an empty queue and no live connection is garbage-collected (proof-of-work gates creating a mailbox, not keeping it). Once a mailbox is collected, its random id is free again, so someone who knows that id could re-register it with their own token. They would only ever receive sealed ciphertext they cannot read, and the original owner is locked out rather than impersonated, but it is a possible nuisance against a long-abandoned mailbox. An active mailbox renews its lease on every connection and inbound message and is never collected.
 
 ## License
 
