@@ -68,25 +68,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # protoc is needed by libsignal's spqr crate (prost-build) on every OS.
       - name: Install Linux build dependencies
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config protobuf-compiler
+          sudo apt-get install -y build-essential libssl-dev pkg-config
 
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+      # protoc is needed by libsignal's spqr crate (prost-build) on every OS.
+      # Use the maintained, token-authenticated action wherever protobuf ships a
+      # native build (avoids the GitHub release CDN 504s/rate limits that broke the
+      # manual Windows download). Covers Linux x64/arm64, macOS x64/arm64, Win x64.
+      - name: Install protoc
+        if: matrix.slug != 'windows-aarch64'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
+      # protobuf publishes no native Windows/ARM64 build, so the ARM runner uses the
+      # x64 protoc under emulation. Kept as a small retrying manual download.
+      - name: Install protoc (Windows ARM, emulated x64)
+        if: matrix.slug == 'windows-aarch64'
         shell: pwsh
         run: |
           $ver = "28.3"
           $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$ver/protoc-$ver-win64.zip"
           $dest = "$env:RUNNER_TEMP\protoc.zip"
-          # The GitHub release CDN occasionally 504s; retry instead of failing the build.
           for ($i = 1; $i -le 5; $i++) {
             try { Invoke-WebRequest -Uri $url -OutFile $dest; break }
             catch {
