@@ -62,17 +62,31 @@ $ReleasePubKeyXml = '<RSAKeyValue><Modulus>umgXLrFiBelXGnDNSem8DfotHj4SBAOFso+R/
 # closed (throws) on any problem.
 function Assert-ReleaseSignature {
   param([string]$ArchivePath, [string]$SumsPath, [string]$SigPath, [string]$AssetName)
-  $seed = New-Object System.Security.Cryptography.RSACryptoServiceProvider
-  $seed.FromXmlString($ReleasePubKeyXml)
-  $params = $seed.ExportParameters($false)
-  # The default CSP from FromXmlString can't do SHA-256; re-import into the
-  # PROV_RSA_AES (24) provider, which can.
-  $csp = New-Object System.Security.Cryptography.CspParameters 24
-  $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider $csp
-  $rsa.ImportParameters($params)
   $sumsBytes = [System.IO.File]::ReadAllBytes($SumsPath)
   $sigBytes  = [System.IO.File]::ReadAllBytes($SigPath)
-  if (-not $rsa.VerifyData($sumsBytes, "SHA256", $sigBytes)) {
+  $verified = $false
+  try {
+    # Primary path: provider-agnostic RSA. Works on PowerShell 7 (.NET 5+) and on
+    # modern Windows PowerShell 5.1 (.NET Framework 4.7.2+). RSASignaturePadding
+    # .Pkcs1 + SHA-256 matches the relay CI's `openssl dgst -sha256 -sign`.
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    $rsa.FromXmlString($ReleasePubKeyXml)
+    $verified = $rsa.VerifyData($sumsBytes, $sigBytes,
+      [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+      [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+  } catch {
+    # Fallback for older Windows PowerShell 5.1, whose default RSACryptoServiceProvider
+    # can't do SHA-256 through the modern API: re-import into the PROV_RSA_AES (24)
+    # provider and use the legacy string-hash overload. Windows-only (needs CAPI).
+    $seed = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+    $seed.FromXmlString($ReleasePubKeyXml)
+    $params = $seed.ExportParameters($false)
+    $csp = New-Object System.Security.Cryptography.CspParameters 24
+    $rsa = New-Object System.Security.Cryptography.RSACryptoServiceProvider $csp
+    $rsa.ImportParameters($params)
+    $verified = $rsa.VerifyData($sumsBytes, "SHA256", $sigBytes)
+  }
+  if (-not $verified) {
     throw "SHA256SUMS signature is INVALID - refusing to install a possibly tampered binary."
   }
   $line = Get-Content $SumsPath | Where-Object { $_ -match ([regex]::Escape($AssetName) + '$') } | Select-Object -First 1
