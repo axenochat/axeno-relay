@@ -16,7 +16,7 @@ Each contact gets a dedicated mailbox with its own tokens and sealed-sender key,
 
 ### Quick setup (recommended)
 
-The setup script downloads the prebuilt relay binary, generates the at-rest key, and offers to install the relay as a hardened, auto-starting service that runs under its own isolated account.
+The setup script downloads the prebuilt relay binary, generates the at-rest key, installs Tor if it is missing (Linux), and installs the relay as a hardened, auto-starting service running under its own isolated account. Run in a terminal it prompts before installing the service; piped from `curl` there is no terminal to prompt on, so it proceeds with the defaults (service install). Pass `--no-service` (bash) / `-NoService` (PowerShell) for a local, non-service setup instead.
 
 Linux / macOS:
 
@@ -34,7 +34,7 @@ Before running anything, both scripts verify the download against a `SHA256SUMS`
 
 On Linux the relay runs under a sandboxed systemd unit with `DynamicUser`; on macOS under a dedicated `_axeno` LaunchDaemon user; on Windows as a scheduled task under the low-privilege `LOCAL SERVICE` account. Pass `--no-service` (bash) or `-NoService` (PowerShell) to set up the binary and config without a service.
 
-On first start the relay generates its keys, and if `tor` is installed it publishes a Tor v3 hidden service and writes the `.onion` address to `onion_address.txt` in the data directory. Share that address with the people who will use your relay.
+On first start the relay generates its keys and publishes a Tor v3 hidden service, writing the `ws://….onion/ws` address to `onion_address.txt` in the data directory. The setup script waits for this and prints the address (first-run Tor bootstrap takes ~30–90s); afterwards you can read it with `sudo cat /var/lib/axeno/onion_address.txt`. Share that address with the people who will use your relay — in the desktop app they add it under **Settings**.
 
 ### Manual setup
 

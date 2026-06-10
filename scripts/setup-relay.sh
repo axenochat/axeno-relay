@@ -102,11 +102,50 @@ if [ "$PLATFORM" != linux ]; then
 fi
 
 for tool in curl tar openssl; do command -v "$tool" >/dev/null || die "required tool not found: $tool"; done
-command -v tor >/dev/null || warn "the 'tor' binary is not on PATH. The relay needs it to publish a .onion address. Install it ($([ "$PLATFORM" = macos ] && echo 'brew install tor' || echo 'apt install tor / dnf install tor')) before starting in production."
 
 gen_key() {
   if command -v openssl >/dev/null; then openssl rand -hex 32
   else head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
+}
+
+# Ensure the 'tor' binary is present. The relay publishes its .onion address by
+# spawning tor at startup, so without tor a freshly installed service runs but is
+# unreachable — the single most confusing failure mode of this script. On Linux
+# we install it automatically with the system package manager (the service path
+# already has root). macOS can't: Homebrew refuses to run as root, so we return
+# failure and the caller prints the one command to run by hand. Returns 0 if tor
+# is available afterward, 1 otherwise.
+ensure_tor() {
+  if command -v tor >/dev/null; then return 0; fi
+  if [ "$PLATFORM" = macos ]; then return 1; fi
+  info "Installing Tor (required to publish the relay's .onion address) ..."
+  if   command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y tor
+  elif command -v dnf     >/dev/null; then dnf install -y tor
+  elif command -v yum     >/dev/null; then yum install -y tor
+  elif command -v pacman  >/dev/null; then pacman -Sy --noconfirm tor
+  elif command -v zypper  >/dev/null; then zypper install -y tor
+  elif command -v apk     >/dev/null; then apk add tor
+  else return 1; fi
+  command -v tor >/dev/null
+}
+
+# Poll for the published onion address for up to ~90s and print it, or fall back
+# to an instruction. $1 = path to onion_address.txt.
+wait_for_onion() {
+  local file="$1" onion=""
+  printf '%s==>%s Waiting for Tor to publish the hidden service (first run can take ~30-90s)' "$c_green" "$c_reset"
+  local i
+  for i in $(seq 1 30); do
+    if [ -s "$file" ]; then onion="$(cat "$file")"; break; fi
+    sleep 3; printf '.'
+  done
+  printf '\n'
+  if [ -n "$onion" ]; then
+    info "Relay address (share this with the people who will use it):"
+    printf '\n    %s%s%s\n\n' "$c_green" "$onion" "$c_reset"
+  else
+    warn "Not published yet — check again shortly with:  sudo cat $file"
+  fi
 }
 
 # --------------------------------------------------------------------------
@@ -142,6 +181,11 @@ chmod +x "$TMP/axeno-relay"
 # --------------------------------------------------------------------------
 # Install. Two modes: hardened system service, or a local unprivileged setup.
 # --------------------------------------------------------------------------
+if [ "$INSTALL_SERVICE" = 1 ] && [ ! -t 0 ] && [ "$ASSUME_YES" != 1 ]; then
+  info "No terminal detected (piped from curl), so prompts use their defaults:"
+  info "installing as an auto-starting hardened service. Re-run with --no-service"
+  info "for a local, non-service install instead."
+fi
 if [ "$INSTALL_SERVICE" = 1 ] && ! confirm "Install Axeno as an auto-starting hardened service?" y; then
   INSTALL_SERVICE=0
 fi
@@ -160,7 +204,14 @@ if [ "$INSTALL_SERVICE" = 0 ]; then
     chmod 600 "$ENV_FILE"
   fi
   info "Installed to $DEST"
-  info "Start it with:  cd '$DEST' && ./axeno-relay"
+  if ! command -v tor >/dev/null; then
+    warn "Tor is not installed. The relay needs it to publish a .onion address."
+    warn "Install it first:  $([ "$PLATFORM" = macos ] && echo 'brew install tor' || echo 'sudo apt install tor   (or your distro'\''s package)')"
+  fi
+  info "Next steps:"
+  info "  1. Start it:  cd '$DEST' && ./axeno-relay"
+  info "  2. Wait ~30-90s, then read your address:  cat '$DEST/axeno-relay-data/onion_address.txt'"
+  info "  3. Share that ws://...onion/ws address; add it in the Axeno desktop app (Settings)."
   info "The .env holds your at-rest key — back it up and keep it private."
   exit 0
 fi
@@ -244,12 +295,31 @@ SystemCallFilter=~@privileged @resources
 WantedBy=multi-user.target
 UNIT_EOF
 
+  # Install Tor before starting so the relay finds it on first launch and can
+  # publish the hidden service immediately (it only checks for tor at startup).
+  TOR_OK=0
+  if ensure_tor; then TOR_OK=1; else
+    warn "Could not install Tor automatically. The relay will run but cannot publish"
+    warn "a .onion address until Tor is installed; then:  systemctl restart axeno-relay"
+  fi
+
   systemctl daemon-reload
   systemctl enable --now axeno-relay.service
   info "Service installed and started (DynamicUser, sandboxed)."
-  info "Status:        systemctl status axeno-relay"
-  info "Logs:          journalctl -u axeno-relay -f"
-  info "Onion address: cat /var/lib/axeno/onion_address.txt   (once Tor publishes it)"
+
+  if [ "$TOR_OK" = 1 ]; then
+    wait_for_onion /var/lib/axeno/onion_address.txt
+  fi
+
+  echo
+  info "Next steps:"
+  info "  1. Share your ws://...onion/ws address (above) with the people who will use this relay."
+  info "  2. In the Axeno desktop app: Settings -> add that relay -> set it as your default."
+  info "  3. Use Add Contact to generate and exchange a connection code, then start messaging."
+  info "Manage the relay:"
+  info "  systemctl status axeno-relay     # health"
+  info "  journalctl -u axeno-relay -f     # live logs"
+  info "  systemctl restart axeno-relay    # restart (e.g. after installing Tor)"
 
 else
   # ---------------------------------------------------------------------
@@ -311,12 +381,33 @@ PLIST_EOF
   chmod 600 "$PLIST"   # root-only: protects AXENO_KEY in the plist
   chown root:wheel "$PLIST"
 
+  # Homebrew refuses to run as root, so tor can't be auto-installed here. Flag it
+  # plainly — without tor the relay starts but never publishes a .onion.
+  TOR_OK=0
+  if command -v tor >/dev/null; then
+    TOR_OK=1
+  else
+    warn "Tor is not installed. Install it as your normal user (not root):  brew install tor"
+    warn "Then restart the relay:  sudo launchctl kickstart -k system/com.axeno.relay"
+  fi
+
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
   info "LaunchDaemon installed and started as user $SVC_USER."
   warn "The AXENO_KEY is stored in $PLIST (root-only). Back it up."
-  info "Logs:          tail -f /var/log/axeno-relay.log"
-  info "Onion address: sudo cat ${DATA}/onion_address.txt   (once Tor publishes it)"
+
+  if [ "$TOR_OK" = 1 ]; then
+    wait_for_onion "${DATA}/onion_address.txt"
+  fi
+
+  echo
+  info "Next steps:"
+  info "  1. Share your ws://...onion/ws address (above) with the people who will use this relay."
+  info "  2. In the Axeno desktop app: Settings -> add that relay -> set it as your default."
+  info "  3. Use Add Contact to generate and exchange a connection code, then start messaging."
+  info "Manage the relay:"
+  info "  sudo launchctl kickstart -k system/com.axeno.relay   # restart"
+  info "  tail -f /var/log/axeno-relay.log                     # live logs"
 fi
 
 info "Done."
