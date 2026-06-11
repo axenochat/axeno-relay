@@ -346,7 +346,12 @@ UNIT_EOF
   fi
 
   systemctl daemon-reload
-  systemctl enable --now axeno-relay.service
+  systemctl enable axeno-relay.service
+  # `restart` (not `enable --now`) so re-running the installer to update the
+  # binary actually swaps the running process: enable --now is a no-op on an
+  # already-active service, which would leave the old binary running. restart
+  # also cleanly starts the service on a fresh install.
+  systemctl restart axeno-relay.service
 
   # Confirm the relay actually stays up rather than reporting success and leaving
   # a crash loop. The usual cause of an immediate failure is leftover state from

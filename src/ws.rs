@@ -138,6 +138,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     state.online.insert(rid.clone(), tx.clone());
                     let store = state.queues.clone();
                     let rid_for_flush = rid.clone();
+                    let mut delivered: u64 = 0;
                     if let Ok(Ok(envs)) = tokio::task::spawn_blocking(move || store.flush(&rid_for_flush)).await {
                         // Use the awaited `send` rather than `try_send`: a large
                         // offline backlog easily exceeds the 256-slot outbound
@@ -150,7 +151,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         // dead socket surfaces as a send error and ends the flush.
                         for env in envs {
                             if tx.send(ServerFrame::Envelope { envelope: env }).await.is_err() { break; }
+                            delivered += 1;
                         }
+                    }
+                    // Terminal marker after the backlog (awaited, so it is ordered
+                    // strictly after the envelopes on this channel). Sent even when
+                    // nothing was queued, so the client always gets a definitive
+                    // "you are caught up" signal right after connecting. Gated on
+                    // the negotiated version: a pre-v6 client has no `synced`
+                    // variant and would reject the whole frame, so don't send it.
+                    if selected >= 6 {
+                        let _ = tx.send(ServerFrame::Synced { count: delivered }).await;
                     }
                 }
             }

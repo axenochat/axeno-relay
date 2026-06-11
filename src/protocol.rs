@@ -47,6 +47,11 @@ pub(crate) enum ServerFrame {
     BundleUploaded { request_id: String, bundle_id: String, expires_at_ms: u64 },
     Bundle { request_id: String, bundle_id: String, ciphertext: String, expires_at_ms: u64 },
     Envelope { envelope: StoredEnvelope },
+    /// Terminal marker sent after the offline-queue flush on `Hello`: every
+    /// `Envelope` that was queued for this mailbox has now been written. `count`
+    /// is how many were delivered in this flush. Lets a client clear its
+    /// "syncing" state precisely instead of guessing from a quiet period.
+    Synced { count: u64 },
     SendOk { id: Uuid, queued: bool, client_ref: Option<String> },
     SendError { client_ref: Option<String>, code: String, message: String },
     DeliveryTokensSet { request_id: String, active_count: usize },

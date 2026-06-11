@@ -14,7 +14,9 @@ pub(crate) const QUEUE_TTL_MS: u64 = 14 * 24 * 60 * 60 * 1000;
 /// How often the background task sweeps expired queued envelopes.
 pub(crate) const QUEUE_SWEEP_INTERVAL_SECS: u64 = 3600;
 pub(crate) const PROTOCOL_MIN_SUPPORTED: u16 = 4;
-pub(crate) const PROTOCOL_VERSION: u16 = 5;
+// v6 adds the `synced` server frame: a terminal marker sent after the
+// offline-queue flush so a client knows its backlog has been fully delivered.
+pub(crate) const PROTOCOL_VERSION: u16 = 6;
 pub(crate) const SENDER_CERT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub(crate) const RATE_WINDOW_MS: u64 = 60 * 1000;
 pub(crate) const MAX_FRAMES_PER_WINDOW: u32 = 600;
