@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     load_dotenv();
 
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("axeno_server=debug".parse()?))
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("axeno_relay=debug".parse()?))
         .init();
 
     // Opt-in, notify-only release check. Off unless AXENO_UPDATE_CHECK is set;
