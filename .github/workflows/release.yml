@@ -33,6 +33,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+# arduino/setup-protoc has no Node 24 release yet. Force every JS action onto
+# Node 24 (the runner default from June 16, 2026) so the runtime switch happens
+# on our terms instead of breaking a release build when the default flips.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -66,7 +72,7 @@ jobs:
             target: ""
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.platform, 'ubuntu')
@@ -144,7 +150,7 @@ jobs:
           Compress-Archive -Path "$env:BIN_DIR/axeno-relay.exe" -DestinationPath "dist/axeno-relay-$env:SLUG.zip" -Force
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: relay-${{ matrix.slug }}
           path: dist/*
@@ -156,7 +162,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
