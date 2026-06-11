@@ -37,9 +37,10 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal", package =
 
 hex = "0.4"
 
-# Optional, opt-in release-notification check (AXENO_UPDATE_CHECK). rustls keeps
-# us off the system OpenSSL; only json + the TLS client are pulled in.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Notify-only release check (AXENO_UPDATE_CHECK), routed through the relay's
+# own tor via its SOCKS port. rustls keeps us off the system OpenSSL; only
+# json + the TLS client + socks proxy support are pulled in.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
 semver = "1"
 
 [dev-dependencies]

@@ -58,7 +58,7 @@ The relay is configured through environment variables. It also reads a `.env` fi
 | `AXENO_DATA_DIR` | `axeno-relay-data` | Directory for persisted state, the at-rest key fallback, and Tor data. |
 | `AXENO_KEY` | *(unset)* | Secret that encrypts the relay's private keys at rest. Recommended for any real deployment. |
 | `AXENO_KEY_FILE` | *(unset)* | Path to a file whose contents are the at-rest secret. Use this for Docker, Kubernetes, or Vault secret mounts so the secret never enters the process environment. |
-| `AXENO_UPDATE_CHECK` | *(unset)* | Set to `1` to let the relay check GitHub daily and log when a newer release exists. Off by default. When on, the relay contacts `api.github.com` over clearnet, which reveals its IP. It only logs; it never downloads or installs anything. |
+| `AXENO_UPDATE_CHECK` | *(unset)* | Daily check for a newer release, routed through the relay's own Tor so GitHub never sees the host's IP. On by default whenever the relay runs its Tor hidden service; without Tor it stays silent. Set to `0` to disable entirely, or `1` to also allow a direct clearnet check when Tor is unavailable (this reveals the host's IP). It only logs; it never downloads or installs anything. |
 | `RUST_LOG` | *(unset)* | Standard `tracing` filter, for example `axeno_relay=debug`. |
 
 ## Hardening

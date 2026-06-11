@@ -61,11 +61,6 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("axeno_relay=debug".parse()?))
         .init();
 
-    // Opt-in, notify-only release check. Off unless AXENO_UPDATE_CHECK is set;
-    // never makes outbound connections otherwise. See update_check for the
-    // privacy rationale.
-    update_check::spawn_if_enabled();
-
     let bind = std::env::var("AXENO_BIND").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
     let addr: SocketAddr = bind.parse()?;
     let data_dir = PathBuf::from(std::env::var("AXENO_DATA_DIR").unwrap_or_else(|_| "axeno-relay-data".to_string()));
@@ -127,13 +122,20 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(%addr, "Axeno relay listening");
 
+    let mut tor_socks_port: Option<u16> = None;
     if addr.ip().is_loopback() {
-        if let Err(e) = start_tor_hidden_service(addr.port(), &data_dir).await {
-            warn!("Failed to start automatic Tor hidden service: {}", e);
+        match start_tor_hidden_service(addr.port(), &data_dir).await {
+            Ok(port) => tor_socks_port = port,
+            Err(e) => warn!("Failed to start automatic Tor hidden service: {}", e),
         }
     } else {
         info!("Server is bound to public IP; skipping automatic Tor hidden service creation.");
     }
+
+    // Notify-only release check. Routed through the relay's own tor (so it
+    // reveals nothing) and on by default when that tor is running; without Tor
+    // it stays silent unless explicitly opted in. See update_check.
+    update_check::spawn(tor_socks_port);
 
     axum::serve(listener, app).await?;
     Ok(())
