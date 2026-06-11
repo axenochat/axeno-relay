@@ -12,7 +12,7 @@ Each contact gets a dedicated mailbox with its own tokens and sealed-sender key,
 
 ## Run a relay
 
-**Linux is recommended for a production relay.** macOS and Windows work and are intended for testing.
+**Linux is recommended for a production relay.** You **CAN** use macOS and Windows, but you probably shouldn't if you really value your privacy.
 
 ### Quick setup (recommended)
 
