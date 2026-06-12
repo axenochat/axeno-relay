@@ -16,7 +16,10 @@ pub(crate) const QUEUE_SWEEP_INTERVAL_SECS: u64 = 3600;
 pub(crate) const PROTOCOL_MIN_SUPPORTED: u16 = 4;
 // v6 adds the `synced` server frame: a terminal marker sent after the
 // offline-queue flush so a client knows its backlog has been fully delivered.
-pub(crate) const PROTOCOL_VERSION: u16 = 6;
+// v7 adds chunked file transfer: the `upload_file_chunk` / `fetch_file_chunk` /
+// `delete_transfer` client frames, their server replies, and the `max_file_bytes`
+// field on `hello_ok` advertising the operator's per-file size cap.
+pub(crate) const PROTOCOL_VERSION: u16 = 7;
 pub(crate) const SENDER_CERT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub(crate) const RATE_WINDOW_MS: u64 = 60 * 1000;
 pub(crate) const MAX_FRAMES_PER_WINDOW: u32 = 600;
@@ -67,3 +70,82 @@ pub(crate) const BUNDLE_PRUNE_MIN_INTERVAL_MS: u64 = 30 * 1000;
 /// How often the background task write-backs dirty mailbox-auth / bundle entries
 /// to the durable store. The crash-durability window for that metadata.
 pub(crate) const META_FLUSH_INTERVAL_SECS: u64 = 5;
+
+// ---------------------------------------------------------------------------
+// File transfer (chunked blob store)
+//
+// Files are NOT stored in the per-mailbox message queue: that queue evicts
+// oldest-first, which would silently shred a multi-chunk transfer. Instead the
+// sender uploads opaque (already E2E-encrypted) chunks into a separate, durable
+// blob store keyed by a random capability `transfer_id`, then delivers a tiny
+// pointer message (carrying the id + decryption key, sealed-sender) through the
+// normal queue. The recipient fetches + reassembles + decrypts, then deletes the
+// transfer. These limits are policy the relay OPERATOR sets, so unlike the
+// constants above they are loaded from the environment via [`FileConfig`]; the
+// values here are only the defaults when the corresponding env var is unset.
+// ---------------------------------------------------------------------------
+
+/// Default per-file ceiling on total stored ciphertext bytes. The official relay
+/// runs this default; operators raise or lower it with `AXENO_MAX_FILE_MIB`.
+pub(crate) const DEFAULT_MAX_FILE_MIB: u64 = 32;
+/// Default global ceiling across all in-flight transfers, bounding total disk.
+/// Override with `AXENO_MAX_TOTAL_FILE_MIB`.
+pub(crate) const DEFAULT_MAX_TOTAL_FILE_MIB: u64 = 8 * 1024;
+/// Default lifetime of an unfetched transfer before the sweep reclaims it. A big
+/// blob is far more disk than a stale text, so this is much shorter than
+/// `QUEUE_TTL_MS`. Override with `AXENO_FILE_TTL_HOURS`.
+pub(crate) const DEFAULT_FILE_TTL_HOURS: u64 = 7 * 24;
+/// Default ceiling on the number of distinct concurrent transfers, so the blob
+/// store cannot be exhausted by many tiny transfers. Override with
+/// `AXENO_MAX_FILE_TRANSFERS`.
+pub(crate) const DEFAULT_MAX_FILE_TRANSFERS: usize = 50_000;
+/// Smallest chunk size we account a declared chunk count against. `total_chunks`
+/// may not exceed `ceil(max_file_bytes / MIN_CHUNK_BYTES)`, which stops a client
+/// from declaring a huge chunk space (e.g. a million 1-byte chunks) for a small
+/// file. Real clients use ~256 KiB chunks, far above this floor.
+pub(crate) const MIN_FILE_CHUNK_BYTES: u64 = 16 * 1024;
+/// How often the background task sweeps expired file transfers.
+pub(crate) const FILE_SWEEP_INTERVAL_SECS: u64 = 1800;
+
+/// Operator-tunable file-transfer limits, loaded once from the environment at
+/// startup and shared (read-only) through [`AppState`](crate::state::AppState).
+#[derive(Debug, Clone)]
+pub(crate) struct FileConfig {
+    /// Max total stored ciphertext bytes for a single transfer.
+    pub(crate) max_file_bytes: u64,
+    /// Max total stored ciphertext bytes across every transfer.
+    pub(crate) max_total_file_bytes: u64,
+    /// Lifetime of an un-deleted transfer before it is swept.
+    pub(crate) file_ttl_ms: u64,
+    /// Max number of distinct concurrent transfers.
+    pub(crate) max_transfers: usize,
+    /// Max declared chunk count for one transfer (derived from `max_file_bytes`).
+    pub(crate) max_chunks: u32,
+}
+
+impl FileConfig {
+    /// Read the file-transfer limits from the environment, falling back to the
+    /// `DEFAULT_*` constants. Invalid or zero values fall back to the default so
+    /// a typo can never disable the size cap entirely.
+    pub(crate) fn from_env() -> Self {
+        let max_file_bytes = env_u64("AXENO_MAX_FILE_MIB", DEFAULT_MAX_FILE_MIB).saturating_mul(1024 * 1024);
+        let max_total_file_bytes = env_u64("AXENO_MAX_TOTAL_FILE_MIB", DEFAULT_MAX_TOTAL_FILE_MIB)
+            .saturating_mul(1024 * 1024)
+            // The global cap must hold at least one max-size file, or no transfer
+            // could ever complete.
+            .max(max_file_bytes);
+        let file_ttl_ms = env_u64("AXENO_FILE_TTL_HOURS", DEFAULT_FILE_TTL_HOURS).saturating_mul(60 * 60 * 1000);
+        let max_transfers = env_u64("AXENO_MAX_FILE_TRANSFERS", DEFAULT_MAX_FILE_TRANSFERS as u64) as usize;
+        let max_chunks = max_file_bytes.div_ceil(MIN_FILE_CHUNK_BYTES).clamp(1, u32::MAX as u64) as u32;
+        Self { max_file_bytes, max_total_file_bytes, file_ttl_ms, max_transfers, max_chunks }
+    }
+}
+
+/// Parse a positive integer env var, falling back to `default` when unset, empty,
+/// unparseable, or zero.
+fn env_u64(key: &str, default: u64) -> u64 {
+    match std::env::var(key) {
+        Ok(v) => v.trim().parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(default),
+        Err(_) => default,
+    }
+}

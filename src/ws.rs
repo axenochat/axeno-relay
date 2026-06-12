@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::config::*;
 use crate::persistence::fresh_rng;
-use crate::protocol::{err, send_err, ClientFrame, RecipientId, ServerFrame, StoredEnvelope};
+use crate::protocol::{err, file_err, send_err, ClientFrame, RecipientId, ServerFrame, StoredEnvelope};
 use crate::state::{AppState, HostedBundle, MailboxAuth};
 use crate::util::{
     atomic_sub_saturating, now_ms, token_hash, valid_bundle_id, valid_recipient_id, valid_token,
@@ -133,6 +133,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     current_protocol: PROTOCOL_VERSION,
                     server_time_ms: now_ms(),
                     trust_root_b64: state.crypto.trust_root_public_b64.clone(),
+                    max_file_bytes: state.file_config.max_file_bytes,
                 });
                 if !cert_only {
                     state.online.insert(rid.clone(), tx.clone());
@@ -317,6 +318,79 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     }
                     _ => { let _ = tx.try_send(err("bundle_not_found", "invite bundle was not found or has expired")); }
                 }
+            }
+            ClientFrame::UploadFileChunk { request_id, transfer_id, chunk_index, total_chunks, total_bytes, ciphertext, pow } => {
+                if !valid_bundle_id(&transfer_id) {
+                    let _ = tx.try_send(file_err(request_id, &transfer_id, "bad_request", "invalid transfer id"));
+                    continue;
+                }
+                // The chunk ciphertext is already E2E-encrypted; decode it to raw
+                // bytes for storage (saves ~33% disk over keeping base64). The
+                // socket-level frame cap already bounds its size.
+                let raw = match STANDARD_NO_PAD.decode(ciphertext.as_bytes()) {
+                    Ok(bytes) => bytes,
+                    Err(_) => { let _ = tx.try_send(file_err(request_id, &transfer_id, "bad_request", "invalid chunk encoding")); continue; }
+                };
+                // Proof-of-work gates the first chunk, which creates the transfer,
+                // so the file store cannot be cheaply exhausted over many sockets.
+                // Later chunks ride the existing transfer and need no PoW.
+                if chunk_index == 0 && !pow.as_deref().map(|n| verify_pow(&transfer_id, n)).unwrap_or(false) {
+                    let _ = tx.try_send(file_err(request_id, &transfer_id, "pow_required", "invalid proof of work for new file transfer"));
+                    continue;
+                }
+                let files = state.files.clone();
+                let tid = transfer_id.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    files.store_chunk(&tid, chunk_index, total_chunks, total_bytes, &raw)
+                }).await;
+                match result {
+                    Ok(Ok(stored)) => {
+                        let _ = tx.try_send(ServerFrame::FileChunkStored {
+                            request_id,
+                            transfer_id,
+                            chunk_index,
+                            received_chunks: stored.received_chunks,
+                            total_chunks: stored.total_chunks,
+                        });
+                    }
+                    Ok(Err(reject)) => { let _ = tx.try_send(file_err(request_id, &transfer_id, reject.code(), reject.message())); }
+                    Err(_) => { let _ = tx.try_send(file_err(request_id, &transfer_id, "relay_full", "could not store file chunk")); }
+                }
+            }
+            ClientFrame::FetchFileChunk { request_id, transfer_id, chunk_index } => {
+                if !valid_bundle_id(&transfer_id) {
+                    let _ = tx.try_send(file_err(request_id, &transfer_id, "bad_request", "invalid transfer id"));
+                    continue;
+                }
+                let files = state.files.clone();
+                let tid = transfer_id.clone();
+                let result = tokio::task::spawn_blocking(move || files.fetch_chunk(&tid, chunk_index)).await;
+                match result {
+                    Ok(Ok(chunk)) => {
+                        let _ = tx.try_send(ServerFrame::FileChunk {
+                            request_id,
+                            transfer_id,
+                            chunk_index,
+                            total_chunks: chunk.total_chunks,
+                            total_bytes: chunk.total_bytes,
+                            ciphertext: STANDARD_NO_PAD.encode(chunk.data),
+                        });
+                    }
+                    Ok(Err(reject)) => { let _ = tx.try_send(file_err(request_id, &transfer_id, reject.code(), reject.message())); }
+                    Err(_) => { let _ = tx.try_send(file_err(request_id, &transfer_id, "not_found", "could not read file chunk")); }
+                }
+            }
+            ClientFrame::DeleteTransfer { request_id, transfer_id } => {
+                if !valid_bundle_id(&transfer_id) {
+                    let _ = tx.try_send(file_err(request_id, &transfer_id, "bad_request", "invalid transfer id"));
+                    continue;
+                }
+                let files = state.files.clone();
+                let tid = transfer_id.clone();
+                // Delete is idempotent: TransferDeleted is sent whether or not the
+                // transfer still existed, so a retried delete is never an error.
+                let _ = tokio::task::spawn_blocking(move || files.delete_transfer(&tid)).await;
+                let _ = tx.try_send(ServerFrame::TransferDeleted { request_id, transfer_id });
             }
             ClientFrame::Ack { ids } => {
                 let Some(rid) = recipient_id.as_ref() else { let _ = tx.try_send(err("not_registered", "send hello first")); continue; };

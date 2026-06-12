@@ -9,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::config::{
-    BUNDLE_PRUNE_MIN_INTERVAL_MS, MAILBOX_IDLE_TTL_MS, MAX_DELIVERY_TOKENS_PER_MAILBOX,
+    BUNDLE_PRUNE_MIN_INTERVAL_MS, FileConfig, MAILBOX_IDLE_TTL_MS, MAX_DELIVERY_TOKENS_PER_MAILBOX,
     MAX_MAILBOXES, MAX_SENDS_PER_DEST_PER_WINDOW, RATE_WINDOW_MS,
 };
+use crate::file_store::FileStore;
 use crate::meta_store::MetaStore;
 use crate::protocol::{ClientTx, RecipientId};
 use crate::queue_store::QueueStore;
@@ -93,6 +94,11 @@ pub(crate) struct AppState {
     /// below are the authoritative hot-path caches; this is the write-back
     /// target, flushed incrementally from the dirty sets.
     pub(crate) meta: Arc<MetaStore>,
+    /// Durable, disk-backed chunked file-transfer blob store.
+    pub(crate) files: Arc<FileStore>,
+    /// Operator-tuned file-transfer limits (per-file cap advertised in HelloOk,
+    /// chunk-shape validation in the upload handler).
+    pub(crate) file_config: FileConfig,
     pub(crate) online: Arc<DashMap<RecipientId, ClientTx>>,
     pub(crate) mailbox_auth: Arc<DashMap<RecipientId, MailboxAuth>>,
     pub(crate) mailbox_count: Arc<AtomicUsize>,
@@ -124,7 +130,7 @@ impl AppState {
     /// Build live in-memory state from the durable stores. `crypto` is the
     /// initialized server signing material; `meta` and `queues` are the opened
     /// disk-backed stores (already migrated from any legacy JSON state).
-    pub(crate) fn build(meta: Arc<MetaStore>, queues: Arc<QueueStore>, crypto: ServerCrypto) -> anyhow::Result<AppState> {
+    pub(crate) fn build(meta: Arc<MetaStore>, queues: Arc<QueueStore>, files: Arc<FileStore>, file_config: FileConfig, crypto: ServerCrypto) -> anyhow::Result<AppState> {
         let mailbox_auth = Arc::new(DashMap::new());
         let load_now = now_ms();
         for (rid, mut auth) in meta.load_all_auth()? {
@@ -147,6 +153,8 @@ impl AppState {
         Ok(AppState {
             queues,
             meta,
+            files,
+            file_config,
             online: Arc::new(DashMap::new()),
             mailbox_count,
             mailbox_auth,

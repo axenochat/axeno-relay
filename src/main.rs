@@ -25,6 +25,7 @@
 //! - `util`        — time, hashing, validation, proof-of-work.
 
 mod config;
+mod file_store;
 mod meta_store;
 mod persistence;
 mod protocol;
@@ -42,7 +43,8 @@ use redb::Database;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::config::{MAILBOX_GC_INTERVAL_SECS, META_FLUSH_INTERVAL_SECS, QUEUE_SWEEP_INTERVAL_SECS};
+use crate::config::{FileConfig, FILE_SWEEP_INTERVAL_SECS, MAILBOX_GC_INTERVAL_SECS, META_FLUSH_INTERVAL_SECS, QUEUE_SWEEP_INTERVAL_SECS};
+use crate::file_store::FileStore;
 use crate::meta_store::MetaStore;
 use crate::persistence::{init_server_crypto, load_disk_state, persist_crypto, prune_disk_state};
 use crate::queue_store::QueueStore;
@@ -77,6 +79,16 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Database::create(data_dir.join("queues.redb"))?);
     let queues = Arc::new(QueueStore::new(db.clone())?);
     let meta = Arc::new(MetaStore::new(db.clone())?);
+    // File-transfer limits are operator policy, read from the environment; the
+    // store shares the same redb database as the queues and metadata.
+    let file_config = FileConfig::from_env();
+    info!(
+        max_file_mib = file_config.max_file_bytes / (1024 * 1024),
+        max_total_file_mib = file_config.max_total_file_bytes / (1024 * 1024),
+        file_ttl_hours = file_config.file_ttl_ms / (60 * 60 * 1000),
+        "file transfer limits"
+    );
+    let files = Arc::new(FileStore::new(db.clone(), file_config.clone())?);
 
     // One-time migration of legacy in-JSON offline queues.
     let legacy_queued: usize = disk.queues.iter().map(|(_, v)| v.len()).sum();
@@ -107,11 +119,12 @@ async fn main() -> anyhow::Result<()> {
     let disk_crypto = disk.crypto.clone().expect("crypto initialized by init_server_crypto");
     persist_crypto(&data_dir, &disk_crypto)?;
 
-    let state = AppState::build(meta, queues, crypto)?;
+    let state = AppState::build(meta, queues, files, file_config, crypto)?;
 
     spawn_meta_flush_task(state.clone());
     spawn_mailbox_gc_task(state.clone());
     spawn_queue_sweep_task(state.clone());
+    spawn_file_sweep_task(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -188,6 +201,26 @@ fn spawn_queue_sweep_task(state: AppState) {
             match tokio::task::spawn_blocking(move || s.queues.sweep_expired()).await {
                 Ok(Ok(n)) if n > 0 => info!(expired = n, "swept expired queued envelopes"),
                 Ok(Err(e)) => warn!("queue sweep failed: {e}"),
+                _ => {}
+            }
+        }
+    });
+}
+
+/// Periodically sweep file transfers older than the operator's TTL so unfetched
+/// or abandoned transfers are reclaimed instead of pinning disk. A big blob is
+/// far more storage than a stale text, so this runs more often than the queue
+/// sweep.
+fn spawn_file_sweep_task(state: AppState) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(FILE_SWEEP_INTERVAL_SECS));
+        interval.tick().await; // skip the immediate first tick
+        loop {
+            interval.tick().await;
+            let s = state.clone();
+            match tokio::task::spawn_blocking(move || s.files.sweep_expired()).await {
+                Ok(Ok(n)) if n > 0 => info!(expired = n, "swept expired file transfers"),
+                Ok(Err(e)) => warn!("file sweep failed: {e}"),
                 _ => {}
             }
         }
