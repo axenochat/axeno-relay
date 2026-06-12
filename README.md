@@ -40,7 +40,7 @@ The script is safe to re-run. If you have installed it several times and the rel
 
 ### Update the relay
 
-**To update, just run the same setup command again.** There is no separate update command. Re-running the script downloads the latest release binary, verifies it against the signed `SHA256SUMS`, and restarts the service onto the new binary. Your at-rest key, relay identity (`.onion` address), and queued messages are all kept — a plain re-run never resets them. Run it exactly as you first did:
+**To update, just run the same setup command again.** There is no separate update command. Re-running the script downloads the latest release binary, verifies it against the signed `SHA256SUMS`, and restarts the service onto the new binary. It will not delete any of your data. Run it exactly as you first did:
 
 Linux / macOS:
 
