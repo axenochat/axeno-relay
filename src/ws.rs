@@ -19,8 +19,8 @@ use crate::persistence::fresh_rng;
 use crate::protocol::{err, file_err, send_err, ClientFrame, RecipientId, ServerFrame, StoredEnvelope};
 use crate::state::{AppState, HostedBundle, MailboxAuth};
 use crate::util::{
-    atomic_sub_saturating, now_ms, token_hash, valid_bundle_id, valid_recipient_id, valid_token,
-    verify_pow,
+    atomic_sub_saturating, ct_eq, now_ms, token_hash, valid_bundle_id, valid_recipient_id,
+    valid_token, verify_pow,
 };
 
 pub(crate) async fn health() -> &'static str { "ok" }
@@ -100,7 +100,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let delivery_hash = token_hash(&delivery_token);
                 let changed = match state.mailbox_auth.entry(rid.clone()) {
                     Entry::Occupied(mut existing) => {
-                        if existing.get().receive_auth_hash != auth_hash {
+                        if !ct_eq(&existing.get().receive_auth_hash, &auth_hash) {
                             let _ = tx.try_send(err("auth_failed", "mailbox auth failed"));
                             continue;
                         }
@@ -286,6 +286,26 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     continue;
                 }
                 state.prune_expired_bundles();
+                // Never let one upload replace another live bundle under the same
+                // id: a third party who learns a bundle id (e.g. glimpses an
+                // invite code) must not be able to destroy the invite before it
+                // is redeemed. A retry of the identical ciphertext is treated as
+                // success so a client resend after a dropped ack still works.
+                {
+                    let now = now_ms();
+                    let existing_reply = state.bundles.get(&bundle_id).and_then(|existing| {
+                        if existing.expires_at_ms <= now { return None; }
+                        if existing.ciphertext == ciphertext {
+                            Some(ServerFrame::BundleUploaded { request_id: request_id.clone(), bundle_id: bundle_id.clone(), expires_at_ms: existing.expires_at_ms })
+                        } else {
+                            Some(err("bundle_exists", "an invite bundle with this id already exists"))
+                        }
+                    });
+                    if let Some(reply) = existing_reply {
+                        let _ = tx.try_send(reply);
+                        continue;
+                    }
+                }
                 if state.bundles.len() >= MAX_BUNDLES {
                     let _ = tx.try_send(err("relay_full", "relay invite bundle limit reached"));
                     continue;

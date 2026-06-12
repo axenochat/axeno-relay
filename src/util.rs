@@ -15,6 +15,16 @@ pub(crate) fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Constant-time equality for token-hash strings. Both operands here are
+/// SHA-256 hex digests (so a timing oracle could at most leak hash bytes, never
+/// a usable preimage), but auth comparisons should not branch on secret-derived
+/// data on principle. The length check short-circuits; lengths are fixed and
+/// public for token hashes.
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() { return false; }
+    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Subtract from an AtomicUsize without ever wrapping past zero. Plain
 /// `fetch_sub` wraps on underflow; if byte accounting ever drifts that would
 /// poison the global queue-memory cap. This keeps the counter floored at 0.

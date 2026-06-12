@@ -52,13 +52,23 @@ use crate::state::AppState;
 use crate::tor::start_tor_hidden_service;
 use crate::ws::{health, ws_handler};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Load a `.env` from the working directory first so operators can keep
     // config (including AXENO_KEY) in one gitignored file instead of exporting
     // it on every launch. Real environment variables always take precedence.
+    //
+    // This must happen before the tokio runtime spawns its worker threads:
+    // mutating the process environment while other threads may read it is
+    // undefined behavior on POSIX (and `set_var` is `unsafe` in Rust 2024).
     load_dotenv();
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive("axeno_relay=debug".parse()?))
         .init();

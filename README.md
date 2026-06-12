@@ -38,6 +38,22 @@ On first start the relay generates its keys and publishes a Tor v3 hidden servic
 
 The script is safe to re-run. If you have installed it several times and the relay no longer starts (the logs mention decrypting relay keys), the at-rest key and the encrypted state have fallen out of sync. Re-run with `--reset` (bash) or `-Reset` (PowerShell) to remove the old key and state and set up fresh. This discards the relay's identity and any queued messages, so contacts pair again.
 
+### Update the relay
+
+**To update, just run the same setup command again.** There is no separate update command. Re-running the script downloads the latest release binary, verifies it against the signed `SHA256SUMS`, and restarts the service onto the new binary. Your at-rest key, relay identity (`.onion` address), and queued messages are all kept — a plain re-run never resets them. Run it exactly as you first did:
+
+Linux / macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
+```
+
+Windows (in an **elevated** PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.ps1 | iex
+```
+
 ### Manual setup
 
 Requirements: Rust stable ([rustup](https://rustup.rs)), `protoc` (`apt install protobuf-compiler`, `brew install protobuf`), and the `tor` binary on your `PATH` to publish a hidden service.

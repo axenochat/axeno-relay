@@ -51,7 +51,8 @@ impl MailboxAuth {
     }
 
     pub(crate) fn accepts_delivery_hash(&self, hash: &str) -> bool {
-        self.delivery_token_hash == hash || self.delivery_token_hashes.iter().any(|h| h == hash)
+        crate::util::ct_eq(&self.delivery_token_hash, hash)
+            || self.delivery_token_hashes.iter().any(|h| crate::util::ct_eq(h, hash))
     }
 
     pub(crate) fn ensure_delivery_hash(&mut self, hash: String) -> bool {
