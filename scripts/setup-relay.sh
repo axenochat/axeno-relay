@@ -214,6 +214,15 @@ tar -xzf "$TMP/relay.tar.gz" -C "$TMP"
 [ -f "$TMP/axeno-relay" ] || die "archive did not contain an axeno-relay binary"
 chmod +x "$TMP/axeno-relay"
 
+# macOS: clear Apple's quarantine flag so Gatekeeper never blocks the binary.
+# In this script's own path this is a no-op — curl and command-line tar don't
+# set the flag, so a fetched binary is never quarantined. It only matters as a
+# safety net if a quarantined binary somehow reaches here (e.g. one downloaded
+# through a web browser). Harmless when there's no flag to remove.
+if [ "$PLATFORM" = macos ]; then
+  xattr -d com.apple.quarantine "$TMP/axeno-relay" 2>/dev/null || true
+fi
+
 # --------------------------------------------------------------------------
 # Install. Two modes: hardened system service, or a local unprivileged setup.
 # --------------------------------------------------------------------------

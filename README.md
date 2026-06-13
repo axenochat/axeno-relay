@@ -32,6 +32,12 @@ irm https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-r
 
 Before running anything, both scripts verify the download against a `SHA256SUMS` manifest signed with the project's release key (the public key is pinned inside each script), and abort if the signature or checksum does not match. HTTPS alone is not trusted.
 
+**macOS note:** If you do not use the install script, you may run into issues with Gatekeeper, as I am not an "Official" Apple developer. To fix this simply run:
+```
+xattr -cr <path to axeno relay binary>
+```
+I may change this in future, but for now it's not feasible, and trivially fixable anyway.
+
 The service runs under an isolated account: a systemd `DynamicUser` on Linux, a dedicated `_axeno` LaunchDaemon user on macOS, and the low-privilege `LOCAL SERVICE` account on Windows.
 
 On first start the relay generates its keys and publishes a Tor v3 hidden service, writing the `ws://<id>.onion/ws` address to `onion_address.txt` in the data directory. The setup script waits for it and prints it; the first Tor bootstrap takes about 30 to 90 seconds. You can read it again later with `sudo cat /var/lib/axeno/onion_address.txt` on Linux, or from the data directory the script prints on macOS and Windows. Give that address to the people who will use your relay; in the desktop app they add it under **Settings**.
