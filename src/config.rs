@@ -30,7 +30,14 @@ pub(crate) const MAX_BUNDLE_BYTES: usize = 16 * 1024;
 /// Total-bytes ceiling for hosted invite bundles, independent of the count cap,
 /// so the bundle store cannot consume `MAX_BUNDLES * MAX_BUNDLE_BYTES` of RAM.
 pub(crate) const MAX_TOTAL_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_BUNDLE_TTL_MS: u64 = 48 * 60 * 60 * 1000;
+/// Maximum lifetime of a hosted invite bundle. Expiry is the ONLY reclamation
+/// path for the bundle store — there is deliberately no delete primitive (a
+/// bundle id is fetchable by anyone who glimpses the code, so allowing deletion
+/// would let them destroy an invite before it is redeemed). This bounds how long
+/// an abandoned bundle pins one of the `MAX_BUNDLES` slots. Set to match
+/// `MAILBOX_IDLE_TTL_MS` so a code and the mailbox it points at share one 30-day
+/// horizon; the client requests this same TTL when uploading.
+pub(crate) const MAX_BUNDLE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub(crate) const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 /// Maximum time a connected socket may go without sending any frame before the
 /// relay closes it. The long-lived receive socket sends a keepalive Ping every
