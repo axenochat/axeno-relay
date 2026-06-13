@@ -19,8 +19,8 @@ use crate::persistence::fresh_rng;
 use crate::protocol::{err, file_err, send_err, ClientFrame, RecipientId, ServerFrame, StoredEnvelope};
 use crate::state::{AppState, HostedBundle, MailboxAuth};
 use crate::util::{
-    atomic_sub_saturating, ct_eq, now_ms, token_hash, valid_bundle_id, valid_recipient_id,
-    valid_token, verify_pow,
+    atomic_sub_saturating, ct_eq, now_activity_ms, now_ms, token_hash, valid_bundle_id,
+    valid_recipient_id, valid_token, verify_pow,
 };
 
 pub(crate) async fn health() -> &'static str { "ok" }
@@ -105,7 +105,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             continue;
                         }
                         let auth = existing.get_mut();
-                        auth.last_active_ms = now_ms();
+                        auth.last_active_ms = now_activity_ms();
                         auth.ensure_delivery_hash(delivery_hash)
                     }
                     Entry::Vacant(vacant) => {
@@ -217,7 +217,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let _ = tx.try_send(send_err(client_ref, "delivery_denied", "delivery token rejected"));
                         continue;
                     }
-                    auth.last_active_ms = now_ms();
+                    auth.last_active_ms = now_activity_ms();
                 }
                 // Authoritative global per-destination rate limit. Counts only
                 // accepted sends and is shared across all sockets, so a holder of

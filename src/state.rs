@@ -16,7 +16,7 @@ use crate::file_store::FileStore;
 use crate::meta_store::MetaStore;
 use crate::protocol::{ClientTx, RecipientId};
 use crate::queue_store::QueueStore;
-use crate::util::now_ms;
+use crate::util::{now_activity_ms, now_ms};
 
 /// Server signing material kept hot in memory for issuing sender certificates.
 pub(crate) struct ServerCrypto {
@@ -46,7 +46,7 @@ impl MailboxAuth {
             receive_auth_hash,
             delivery_token_hash: delivery_hash.clone(),
             delivery_token_hashes: vec![delivery_hash],
-            last_active_ms: now_ms(),
+            last_active_ms: now_activity_ms(),
         }
     }
 
@@ -133,7 +133,7 @@ impl AppState {
     /// disk-backed stores (already migrated from any legacy JSON state).
     pub(crate) fn build(meta: Arc<MetaStore>, queues: Arc<QueueStore>, files: Arc<FileStore>, file_config: FileConfig, crypto: ServerCrypto) -> anyhow::Result<AppState> {
         let mailbox_auth = Arc::new(DashMap::new());
-        let load_now = now_ms();
+        let load_now = now_activity_ms();
         for (rid, mut auth) in meta.load_all_auth()? {
             // Give pre-existing mailboxes (written before idle GC existed, or
             // simply never touched this run) a fresh activity lease so the GC

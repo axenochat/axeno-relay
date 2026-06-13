@@ -5,10 +5,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use crate::config::POW_LEADING_ZERO_BITS;
+use crate::config::{MAILBOX_ACTIVITY_GRANULARITY_MS, POW_LEADING_ZERO_BITS};
 
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// `now_ms()` rounded down to [`MAILBOX_ACTIVITY_GRANULARITY_MS`], for mailbox
+/// last-active timestamps. Coarsening at assignment (rather than at read time)
+/// means the precise activity time never reaches memory or disk.
+pub(crate) fn now_activity_ms() -> u64 {
+    let now = now_ms();
+    now - (now % MAILBOX_ACTIVITY_GRANULARITY_MS)
 }
 
 pub(crate) fn token_hash(token: &str) -> String {

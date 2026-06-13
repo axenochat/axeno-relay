@@ -60,6 +60,12 @@ pub(crate) const POW_LEADING_ZERO_BITS: u32 = 22;
 pub(crate) const MAILBOX_IDLE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// How often the background task sweeps for idle mailboxes to garbage-collect.
 pub(crate) const MAILBOX_GC_INTERVAL_SECS: u64 = 3600;
+/// Granularity to which a mailbox's last-active timestamp is rounded before it
+/// is stored. Idle GC only compares it against a 30-day TTL, so millisecond
+/// precision serves no purpose and a persisted state snapshot could otherwise
+/// use it to profile a mailbox's activity. Round down to the day so an at-rest
+/// value reveals only "active on day D", never an exact time.
+pub(crate) const MAILBOX_ACTIVITY_GRANULARITY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Global ceiling on concurrent WebSocket connections. A backstop against a
 /// connection flood exhausting file descriptors and per-socket task/channel
 /// memory; well above any legitimate per-contact connection load.
