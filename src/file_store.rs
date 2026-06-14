@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -196,29 +197,46 @@ impl FileStore {
         }
         let data_len = data.len() as u64;
 
-        // Reserve a creation slot up front (before the write txn) so the global
-        // caps are honored. If anything below fails we release the reservation.
-        let creating = !self.meta.contains_key(transfer_id);
-        if creating {
-            if chunk_index != 0 {
-                // A transfer is only ever created by its first chunk; a stray
-                // later chunk for an unknown id is a malformed/expired fetch.
-                return Err(FileReject::NotFound);
-            }
-            self.reserve(total_bytes)?;
-        } else {
-            // Consistency: every chunk of a transfer must agree on its shape, so a
-            // second uploader cannot reshape or corrupt an in-flight transfer.
-            if let Some(m) = self.meta.get(transfer_id) {
+        // Claim the transfer id atomically via the cache entry so two concurrent
+        // first chunks for the same id cannot both take the "creating" path and
+        // double-reserve a slot + bytes (which would leak that reservation, since
+        // a later delete only releases it once). The vacant arm inserts a
+        // provisional meta so a racing caller observes the id as already existing
+        // and falls into the consistency-checked update path instead.
+        let creating = match self.meta.entry(transfer_id.to_string()) {
+            Entry::Occupied(existing) => {
+                // Consistency: every chunk of a transfer must agree on its shape,
+                // so a second uploader cannot reshape or corrupt it in flight.
+                let m = existing.get();
                 if m.total_chunks != total_chunks || m.total_bytes != total_bytes {
                     return Err(FileReject::BadRequest);
                 }
+                false
+            }
+            Entry::Vacant(slot) => {
+                if chunk_index != 0 {
+                    // A transfer is only ever created by its first chunk; a stray
+                    // later chunk for an unknown id is a malformed/expired fetch.
+                    return Err(FileReject::NotFound);
+                }
+                slot.insert(FileMeta { total_chunks, total_bytes, stored_bytes: 0, received_chunks: 0, created_at_ms: now_ms() });
+                true
+            }
+        };
+
+        // Reserve against the global caps for a creation. On failure release the
+        // provisional claim so the id is free again.
+        if creating {
+            if let Err(e) = self.reserve(total_bytes) {
+                self.meta.remove(transfer_id);
+                return Err(e);
             }
         }
 
         let result = self.write_chunk(transfer_id, chunk_index, total_chunks, total_bytes, data, data_len, creating);
         if result.is_err() && creating {
             self.release(total_bytes);
+            self.meta.remove(transfer_id);
         }
         result
     }
@@ -237,7 +255,7 @@ impl FileStore {
         creating: bool,
     ) -> Result<StoredChunk, FileReject> {
         let txn = self.db.begin_write().map_err(|_| FileReject::Full)?;
-        let (received_chunks, stored_bytes) = {
+        let (received_chunks, stored_bytes, created_at_ms) = {
             let mut meta_table = txn.open_table(FILE_META).map_err(|_| FileReject::Full)?;
             let mut chunk_table = txn.open_table(FILE_CHUNKS).map_err(|_| FileReject::Full)?;
 
@@ -270,15 +288,18 @@ impl FileStore {
             chunk_table.insert(key.as_str(), data).map_err(|_| FileReject::Full)?;
             let meta_bytes = serde_json::to_vec(&meta).map_err(|_| FileReject::Full)?;
             meta_table.insert(transfer_id, meta_bytes.as_slice()).map_err(|_| FileReject::Full)?;
-            (meta.received_chunks, meta.stored_bytes)
+            (meta.received_chunks, meta.stored_bytes, meta.created_at_ms)
         };
         txn.commit().map_err(|_| FileReject::Full)?;
 
         // The count + reserved bytes were already accounted by `reserve` on the
-        // creation path, so nothing to add here.
+        // creation path, so nothing to add here. Mirror the SAME created_at that
+        // was just written to disk into the cache — not a fresh `now_ms()` — so a
+        // later chunk can never bump the cached timestamp past the durable one and
+        // skew TTL expiry (which sweeps off the cache) away from disk.
         self.meta.insert(
             transfer_id.to_string(),
-            FileMeta { total_chunks, total_bytes, stored_bytes, received_chunks, created_at_ms: now_ms() },
+            FileMeta { total_chunks, total_bytes, stored_bytes, received_chunks, created_at_ms },
         );
         Ok(StoredChunk { received_chunks, total_chunks })
     }
@@ -458,6 +479,43 @@ mod tests {
         let again = store.store_chunk(id, 0, 2, 200, &vec![7u8; 100]).unwrap();
         assert_eq!(again.received_chunks, 1); // not double-counted
         assert_eq!(store.fetch_chunk(id, 0).unwrap().data, vec![7u8; 100]); // replaced
+    }
+
+    #[test]
+    fn re_creating_chunk_zero_does_not_double_reserve() {
+        // A second "first chunk" for an existing transfer must not take the
+        // creation path again and reserve a second slot + bytes — otherwise a
+        // delete would only release one and the rest would leak.
+        let (_d, store) = temp_store(1);
+        let id = "transfer_abcdefghijklmnop";
+        store.store_chunk(id, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        store.store_chunk(id, 0, 2, 200, &vec![7u8; 100]).unwrap();
+        assert_eq!(store.transfer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 200);
+        // Deleting once frees everything: no leaked reservation remains.
+        assert!(store.delete_transfer(id).unwrap());
+        assert_eq!(store.transfer_count.load(Ordering::Relaxed), 0);
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cached_created_at_matches_disk_after_later_chunk() {
+        // A later chunk must not bump the cached created_at past the durable one,
+        // or TTL expiry (which sweeps off the cache) would drift from disk.
+        let (_d, store) = temp_store(1);
+        let id = "transfer_abcdefghijklmnop";
+        store.store_chunk(id, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        let created_after_first = store.meta.get(id).unwrap().created_at_ms;
+        store.store_chunk(id, 1, 2, 200, &vec![2u8; 100]).unwrap();
+        let cached = store.meta.get(id).unwrap().created_at_ms;
+        let disk = {
+            let txn = store.db.begin_read().unwrap();
+            let t = txn.open_table(FILE_META).unwrap();
+            let m: FileMeta = serde_json::from_slice(t.get(id).unwrap().unwrap().value()).unwrap();
+            m.created_at_ms
+        };
+        assert_eq!(cached, disk);
+        assert_eq!(cached, created_after_first);
     }
 
     #[test]
