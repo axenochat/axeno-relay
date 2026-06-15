@@ -90,8 +90,14 @@ fi
 
 echo "==> Cargo.toml + Cargo.lock"
 # Replace only the [package] version line (the first `version = ` in the file).
-sed -i.bak -E "0,/^version = \"[^\"]*\"/s//version = \"$VERSION\"/" Cargo.toml
-rm -f Cargo.toml.bak
+# Use Python instead of sed -i because BSD sed (macOS) doesn't support 0,/pattern/.
+python3 -c "
+import re, sys
+path, v = sys.argv[1], sys.argv[2]
+t = open(path).read()
+t = re.sub(r'^version = \"[^\"]*\"', 'version = \"' + v + '\"', t, count=1, flags=re.MULTILINE)
+open(path, 'w').write(t)
+" Cargo.toml "$VERSION"
 cargo update --package axeno-relay --offline --quiet
 
 echo "==> committing version bump"
