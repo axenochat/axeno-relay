@@ -39,6 +39,14 @@ pub(crate) const MAX_TOTAL_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// horizon; the client requests this same TTL when uploading.
 pub(crate) const MAX_BUNDLE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 pub(crate) const OUTBOUND_QUEUE_CAPACITY: usize = 256;
+/// Maximum time a single outbound frame may take to write to the socket before
+/// the relay gives up and drops the connection. Bounds a peer that authenticates
+/// and then stops reading (a dead TCP connection, or a malicious client) from
+/// pinning the writer task, its outbound channel, and an in-progress offline-queue
+/// flush indefinitely — the inbound idle timeout only covers time spent waiting to
+/// *receive* a frame, never time spent awaiting a *send*. Generous, because a
+/// legitimate flush over a slow Tor circuit can take a while per frame.
+pub(crate) const OUTBOUND_SEND_TIMEOUT_SECS: u64 = 120;
 /// Maximum time a connected socket may go without sending any frame before the
 /// relay closes it. The long-lived receive socket sends a keepalive Ping every
 /// 30s and one-shot sockets (send/cert/bundle/retire) complete within their own
@@ -119,6 +127,17 @@ pub(crate) const DEFAULT_MAX_FILE_TRANSFERS: usize = 50_000;
 pub(crate) const MIN_FILE_CHUNK_BYTES: u64 = 16 * 1024;
 /// How often the background task sweeps expired file transfers.
 pub(crate) const FILE_SWEEP_INTERVAL_SECS: u64 = 1800;
+/// Incomplete transfers (not every declared chunk received yet) are reclaimed far
+/// sooner than fully-received ones. A transfer reserves its whole declared
+/// `total_bytes` against the global byte cap the instant its first chunk creates
+/// it, so a flood of created-but-never-finished transfers — one cheap proof-of-work
+/// each — would otherwise pin the entire file budget for the full `file_ttl_ms`
+/// (default 7 days), denying file transfer relay-wide. Capping the lifetime of an
+/// *incomplete* transfer to this much shorter window makes that reservation
+/// self-heal in ~an hour instead. A legitimate multi-chunk upload completes well
+/// within this window even over Tor. Clamped to never exceed the operator's
+/// `file_ttl_ms` (see [`FileStore::sweep_expired`](crate::file_store)).
+pub(crate) const INCOMPLETE_FILE_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// Operator-tunable file-transfer limits, loaded once from the environment at
 /// startup and shared (read-only) through [`AppState`](crate::state::AppState).

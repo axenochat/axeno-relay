@@ -293,13 +293,30 @@ impl AppState {
         if stale.is_empty() { return; }
         let mut removed = 0usize;
         for rid in &stale {
-            if self.mailbox_auth.remove(rid).is_some() {
+            // Re-check idleness and offline-ness atomically under the map's entry
+            // lock before removing. The candidate snapshot above and this removal
+            // are an hour apart at most, but in that window a Hello or an inbound
+            // send can reactivate the mailbox: both refresh `last_active_ms` (the
+            // send path also re-queues, so the lease covers a newly non-empty queue
+            // too) and a live receiver inserts into `online`. Without this guard a
+            // just-reconnected mailbox could be collected — and its fresh queue
+            // purged. `remove_if` only deletes when the predicate still holds.
+            let collected = self
+                .mailbox_auth
+                .remove_if(rid, |_, auth| {
+                    now.saturating_sub(auth.last_active_ms) > MAILBOX_IDLE_TTL_MS
+                        && !self.online.contains_key(rid)
+                })
+                .is_some();
+            if collected {
                 self.mailbox_count.fetch_sub(1, Ordering::Relaxed);
                 self.mark_auth_dirty(rid);
                 removed += 1;
+                // Only reclaim the queue and rate state for a mailbox we actually
+                // collected; a reactivated one keeps its (now non-empty) queue.
+                let _ = self.queues.purge_mailbox(rid);
+                self.send_rate.remove(rid);
             }
-            let _ = self.queues.purge_mailbox(rid);
-            self.send_rate.remove(rid);
         }
         if removed > 0 {
             info!(removed, "garbage-collected idle mailboxes");

@@ -35,7 +35,34 @@ warn()  { printf '%sWARN:%s %s\n' "$c_yellow" "$c_reset" "$*" >&2; }
 err()   { printf '%sERROR:%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 
-usage() { sed -n '2,/^set /p' "$0" | sed '/^set /d; s/^# \{0,1\}//'; exit 0; }
+# Self-contained so it works when piped from curl, where $0 is not the script.
+usage() {
+  cat <<'EOF'
+Axeno relay setup (Linux and macOS).
+
+Downloads the prebuilt relay binary from GitHub Releases, generates an at-rest
+encryption key, writes a config file, and optionally installs the relay as a
+hardened, auto-starting service running under its own isolated user.
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.sh | sudo bash
+  sudo bash setup-relay.sh [flags]
+
+  When piped from curl, pass flags after `-s --`, e.g.:
+  curl -fsSL <url> | sudo bash -s -- --no-service
+
+Flags:
+  --no-service     set up the binary + config but do not install a service
+  --reset          remove any existing relay state and at-rest key, then set up fresh
+  --yes, -y        assume "yes" to prompts (non-interactive)
+  --bind ADDR      listen address (default 127.0.0.1:8787; loopback enables Tor)
+  --help, -h       show this help
+
+Linux is the recommended platform for a production relay. macOS works but is
+intended for testing.
+EOF
+  exit 0
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in

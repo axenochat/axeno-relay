@@ -297,10 +297,26 @@ impl FileStore {
         // was just written to disk into the cache — not a fresh `now_ms()` — so a
         // later chunk can never bump the cached timestamp past the durable one and
         // skew TTL expiry (which sweeps off the cache) away from disk.
-        self.meta.insert(
-            transfer_id.to_string(),
-            FileMeta { total_chunks, total_bytes, stored_bytes, received_chunks, created_at_ms },
-        );
+        //
+        // Advance the cache, never regress it. redb serializes the write
+        // transactions, but their post-commit cache updates are not ordered, so two
+        // concurrent chunk writes could otherwise apply out of commit order and
+        // leave a stale `received_chunks`/`stored_bytes` behind. Keying the update
+        // on a non-decreasing `received_chunks` keeps the cache at the most-complete
+        // view that actually reached disk.
+        {
+            let mut e = self.meta.entry(transfer_id.to_string()).or_insert(FileMeta {
+                total_chunks,
+                total_bytes,
+                stored_bytes,
+                received_chunks,
+                created_at_ms,
+            });
+            if received_chunks >= e.received_chunks {
+                e.stored_bytes = stored_bytes;
+                e.received_chunks = received_chunks;
+            }
+        }
         Ok(StoredChunk { received_chunks, total_chunks })
     }
 
@@ -357,11 +373,22 @@ impl FileStore {
     /// Returns how many transfers were reclaimed. Intended to run periodically
     /// off the request path.
     pub(crate) fn sweep_expired(&self) -> anyhow::Result<usize> {
-        let cutoff = now_ms().saturating_sub(self.config.file_ttl_ms);
+        let now = now_ms();
+        let full_cutoff = now.saturating_sub(self.config.file_ttl_ms);
+        // Incomplete transfers expire on the much shorter incomplete window, so a
+        // flood of created-but-never-finished transfers cannot pin their reserved
+        // bytes for the full TTL. Never let that window exceed the operator's TTL
+        // (an operator may configure a very short file TTL).
+        let incomplete_cutoff = now
+            .saturating_sub(crate::config::INCOMPLETE_FILE_TTL_MS.min(self.config.file_ttl_ms));
         let expired: Vec<String> = self
             .meta
             .iter()
-            .filter(|e| e.value().created_at_ms < cutoff)
+            .filter(|e| {
+                let m = e.value();
+                let cutoff = if m.received_chunks >= m.total_chunks { full_cutoff } else { incomplete_cutoff };
+                m.created_at_ms < cutoff
+            })
             .map(|e| e.key().clone())
             .collect();
         let mut removed = 0usize;
@@ -546,5 +573,53 @@ mod tests {
         store.meta.get_mut(id).unwrap().created_at_ms = 1;
         assert_eq!(store.sweep_expired().unwrap(), 1);
         assert!(!store.exists(id));
+    }
+
+    #[test]
+    fn sweep_reclaims_incomplete_before_full_ttl() {
+        // A transfer missing chunks must be reclaimed on the short incomplete
+        // window even though the operator's full file TTL is far longer, so a
+        // created-but-never-finished transfer cannot pin its reserved bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("files.redb")).unwrap());
+        let config = FileConfig {
+            max_file_bytes: 1024 * 1024,
+            max_total_file_bytes: 64 * 1024 * 1024,
+            file_ttl_ms: 24 * 60 * 60 * 1000, // long full TTL (24h)
+            max_transfers: 100,
+            max_chunks: (1024 * 1024u64).div_ceil(16 * 1024) as u32,
+        };
+        let store = FileStore::new(db, config).unwrap();
+
+        // Incomplete: 1 of 2 chunks. Reserves the full 200 declared bytes.
+        let incomplete = "transfer_incomplete00000";
+        store.store_chunk(incomplete, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        // Complete: both chunks present.
+        let complete = "transfer_complete0000000";
+        store.store_chunk(complete, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        store.store_chunk(complete, 1, 2, 200, &vec![2u8; 100]).unwrap();
+
+        // Age both well past the incomplete window but inside the 24h full TTL.
+        let aged = now_ms().saturating_sub(crate::config::INCOMPLETE_FILE_TTL_MS + 60_000);
+        for id in [incomplete, complete] {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(FILE_META).unwrap();
+                let mut m: FileMeta = serde_json::from_slice(t.get(id).unwrap().unwrap().value()).unwrap();
+                m.created_at_ms = aged;
+                let b = serde_json::to_vec(&m).unwrap();
+                t.insert(id, b.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+            store.meta.get_mut(id).unwrap().created_at_ms = aged;
+        }
+
+        // Only the incomplete one is reclaimed; the complete one survives until
+        // its full TTL, and its reservation is released with it.
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(!store.exists(incomplete));
+        assert!(store.exists(complete));
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 200);
+        assert_eq!(store.transfer_count.load(Ordering::Relaxed), 1);
     }
 }
