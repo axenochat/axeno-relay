@@ -1,6 +1,6 @@
 [package]
 name = "axeno-relay"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Minimal Axeno WebSocket relay server for opaque encrypted envelopes"
 
