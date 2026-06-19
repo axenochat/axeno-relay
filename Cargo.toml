@@ -45,6 +45,7 @@ semver = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.24"
 
 [patch.crates-io]
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
