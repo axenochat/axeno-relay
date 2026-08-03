@@ -75,8 +75,14 @@ pub(crate) const MAILBOX_GC_INTERVAL_SECS: u64 = 3600;
 pub(crate) const MAILBOX_ACTIVITY_GRANULARITY_MS: u64 = 24 * 60 * 60 * 1000;
 /// Global ceiling on concurrent WebSocket connections. A backstop against a
 /// connection flood exhausting file descriptors and per-socket task/channel
-/// memory; well above any legitimate per-contact connection load.
-pub(crate) const MAX_CONNECTIONS: usize = 100_000;
+/// memory. Sized to sit above real load — a relay tops out around a few hundred
+/// active users, each holding roughly one circuit per contact route, i.e. low
+/// thousands of sockets — while staying low enough to actually bound fd/memory use
+/// before the tor daemon itself becomes the limit (the old 100k never bit before
+/// tor fell over). Operators expecting more should run several relays, not raise
+/// this. A stock process fd limit (often 1024) will cap sockets first anyway;
+/// raise `LimitNOFILE` alongside this if you tune it up.
+pub(crate) const MAX_CONNECTIONS: usize = 16_384;
 /// Minimum spacing between full expired-invite-bundle scans, so pruning on every
 /// bundle request stays O(1) amortized rather than O(bundles) per request.
 pub(crate) const BUNDLE_PRUNE_MIN_INTERVAL_MS: u64 = 30 * 1000;
@@ -160,5 +166,29 @@ fn env_u64(key: &str, default: u64) -> u64 {
     match std::env::var(key) {
         Ok(v) => v.trim().parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(default),
         Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod wire_constant_tripwire {
+    //! These constants are part of the wire contract shared with the desktop
+    //! client (axeno-desktop `transport.rs`), which lives in a SEPARATE repository
+    //! and hard-codes the same values. They cannot share a crate, so these tests
+    //! pin the literals: any change here fails CI loudly and is a reminder to ship
+    //! the matching change to the client in lockstep (see the notes on each const).
+    use super::*;
+
+    #[test]
+    fn pow_difficulty_matches_client() {
+        // Must equal axeno-desktop transport.rs `POW_LEADING_ZERO_BITS`.
+        assert_eq!(POW_LEADING_ZERO_BITS, 22);
+    }
+
+    #[test]
+    fn protocol_range_matches_client() {
+        // Must stay in sync with axeno-desktop transport.rs `PROTOCOL_VERSION` /
+        // `PROTOCOL_MIN_SUPPORTED`. Raise the client's max first, then the relay.
+        assert_eq!(PROTOCOL_VERSION, 7);
+        assert_eq!(PROTOCOL_MIN_SUPPORTED, 4);
     }
 }

@@ -33,7 +33,7 @@ rand_chacha = "0.9"
 
 # Pinned to the same reviewed commit as the desktop client so the two stay in
 # lockstep and a `cargo update` cannot drift either onto upstream main.
-libsignal-protocol = { git = "https://github.com/signalapp/libsignal", package = "libsignal-protocol", rev = "6e5a0466b35e23925ad4b3a31a8c6572471c33d9" }
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", package = "libsignal-protocol", tag = "v0.99.3" }
 
 hex = "0.4"
 

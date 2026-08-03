@@ -156,7 +156,21 @@ fn decrypt_disk_crypto(blob: &EncryptedCryptoBlob, env_key: &str) -> anyhow::Res
 /// the ciphertext and only defends against leaking the state file alone.
 fn relay_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
     if let Ok(k) = std::env::var("AXENO_KEY") {
-        if !k.is_empty() { return Ok(k); }
+        if !k.is_empty() {
+            // The at-rest wrapping derives its key from this secret with Argon2id at
+            // moderate cost — right for a random 256-bit value (what the setup
+            // scripts and `openssl rand -hex 32` produce), but not enough to protect
+            // a short, guessable passphrase against an attacker who steals the state
+            // file. Warn rather than fail so existing deployments are unaffected.
+            if k.len() < 32 {
+                warn!(
+                    "AXENO_KEY is short ({} chars); treat it as a key, not a password. \
+                     Use a high-entropy value such as `openssl rand -hex 32`.",
+                    k.len()
+                );
+            }
+            return Ok(k);
+        }
     }
     if let Ok(path) = std::env::var("AXENO_KEY_FILE") {
         if !path.is_empty() {
