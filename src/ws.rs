@@ -46,10 +46,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<ServerFrame>(OUTBOUND_QUEUE_CAPACITY);
 
+    let write_timeout = std::time::Duration::from_secs(OUTBOUND_SEND_TIMEOUT_SECS);
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             match serde_json::to_string(&frame) {
-                Ok(text) => { if sender.send(Message::Text(text.into())).await.is_err() { break; } }
+                Ok(text) => {
+                    // Bound each write: a peer that authenticates and then stops
+                    // reading (dead TCP, or a malicious client) would otherwise
+                    // wedge this send forever — and with it the offline-queue flush
+                    // that applies backpressure through this same channel. On a send
+                    // error or a timeout, stop draining so the socket is dropped and
+                    // the connection loop unwinds.
+                    match tokio::time::timeout(write_timeout, sender.send(Message::Text(text.into()))).await {
+                        Ok(Ok(())) => {}
+                        _ => break,
+                    }
+                }
                 Err(e) => error!(?e, "failed to serialize server frame"),
             }
         }
@@ -101,7 +113,14 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 let changed = match state.mailbox_auth.entry(rid.clone()) {
                     Entry::Occupied(mut existing) => {
                         if !ct_eq(&existing.get().receive_auth_hash, &auth_hash) {
-                            let _ = tx.try_send(err("auth_failed", "mailbox auth failed"));
+                            // Deliberately the SAME rejection the vacant/bad-pow arm
+                            // below sends. Distinct "wrong auth" vs "needs pow"
+                            // responses would tell a prober whether a guessed mailbox
+                            // id is registered; a legitimate client never hits this
+                            // (it either holds the auth token for an existing mailbox
+                            // or computed a pow for a new one), so one unified error
+                            // costs real users nothing and closes that oracle.
+                            let _ = tx.try_send(err("hello_rejected", "mailbox authentication or proof of work failed"));
                             continue;
                         }
                         let auth = existing.get_mut();
@@ -111,7 +130,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     Entry::Vacant(vacant) => {
                         let valid_pow = pow.as_deref().map(|n| verify_pow(&rid, n)).unwrap_or(false);
                         if !valid_pow {
-                            let _ = tx.try_send(err("bad_pow", "invalid proof of work for new mailbox"));
+                            // Same unified rejection as the wrong-auth arm above so
+                            // the response cannot distinguish "exists" from "free".
+                            let _ = tx.try_send(err("hello_rejected", "mailbox authentication or proof of work failed"));
                             continue;
                         }
                         if !state.reserve_mailbox_slot() {
@@ -201,8 +222,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     let _ = tx.try_send(send_err(client_ref, "bad_send", "invalid destination or delivery token"));
                     continue;
                 }
-                if envelope_type.len() > 32 || ciphertext.len() > MAX_FRAME_BYTES {
-                    let _ = tx.try_send(send_err(client_ref, "bad_envelope", "envelope rejected by size/type limits"));
+                // The whole frame is already bounded by the WebSocket layer
+                // (`max_message_size(MAX_FRAME_BYTES)`), so `ciphertext` — a
+                // substring of that frame — can never exceed it; only the small
+                // `envelope_type` tag needs its own explicit cap here.
+                if envelope_type.len() > 32 {
+                    let _ = tx.try_send(send_err(client_ref, "bad_envelope", "envelope type too long"));
                     continue;
                 }
                 // Validate delivery authorization before counting against any
@@ -401,6 +426,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 }
             }
             ClientFrame::DeleteTransfer { request_id, transfer_id } => {
+                // Delete is intentionally unauthenticated: knowledge of the random
+                // capability `transfer_id` IS the authorization, exactly as it is
+                // for fetch. This is the opposite choice from invite bundles, which
+                // forbid deletion so a third party who glimpses an invite code cannot
+                // destroy it before redemption — but a transfer id only ever travels
+                // inside the sealed-sender pointer message, alongside the file's
+                // decryption key, so anyone able to delete a transfer could already
+                // read it. The recipient deletes after reassembly to reclaim storage
+                // ahead of the TTL sweep.
                 if !valid_bundle_id(&transfer_id) {
                     let _ = tx.try_send(file_err(request_id, &transfer_id, "bad_request", "invalid transfer id"));
                     continue;

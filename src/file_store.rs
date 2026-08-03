@@ -43,11 +43,14 @@ const FILE_CHUNKS: TableDefinition<&str, &[u8]> = TableDefinition::new("file_chu
 struct FileMeta {
     /// Total number of chunks the whole transfer is declared to have.
     total_chunks: u32,
-    /// Declared total raw ciphertext bytes across all chunks. Reserved against
-    /// the global byte cap at creation so a transfer is never accepted that the
-    /// relay cannot finish storing.
+    /// Declared total raw ciphertext bytes across all chunks. This is a SHAPE
+    /// bound only — a chunk is rejected if it would push `stored_bytes` past it —
+    /// NOT a reservation. The global byte cap accounts `stored_bytes` (what is
+    /// actually on disk), so declaring a large `total_bytes` and never uploading
+    /// it costs nothing against the shared budget.
     total_bytes: u64,
-    /// Raw bytes actually stored so far (sum of received chunk lengths).
+    /// Raw bytes actually stored so far (sum of received chunk lengths). This is
+    /// what the transfer holds against the global byte cap.
     stored_bytes: u64,
     /// Count of distinct chunk indices stored so far.
     received_chunks: u32,
@@ -111,8 +114,11 @@ pub(crate) struct FileStore {
     /// Per-transfer metadata cache; redb is authoritative, this gives O(1) hot
     /// path validation. Rebuilt by a full scan on open, kept in sync thereafter.
     meta: DashMap<String, FileMeta>,
-    /// Sum of declared `total_bytes` across all live transfers, reserved at
-    /// creation. The global byte cap is checked against this.
+    /// Sum of `stored_bytes` (bytes ACTUALLY on disk) across all live transfers.
+    /// The global byte cap is checked against this and the increase is reserved
+    /// per chunk as it is stored, so a transfer can only ever hold what it has
+    /// really uploaded — declaring a huge size and sending one byte reserves one
+    /// byte, not the whole declared size.
     reserved_bytes: AtomicU64,
     /// Number of live transfers, for the transfer-count cap.
     transfer_count: AtomicUsize,
@@ -157,7 +163,8 @@ impl FileStore {
         for entry in table.iter()? {
             let (k, v) = entry?;
             if let Ok(meta) = serde_json::from_slice::<FileMeta>(v.value()) {
-                reserved = reserved.saturating_add(meta.total_bytes);
+                // Account actual bytes on disk, not the declared size.
+                reserved = reserved.saturating_add(meta.stored_bytes);
                 count += 1;
                 self.meta.insert(k.value().to_string(), meta);
             }
@@ -224,10 +231,11 @@ impl FileStore {
             }
         };
 
-        // Reserve against the global caps for a creation. On failure release the
+        // Reserve a transfer-count slot for a creation (the byte budget is reserved
+        // per chunk, by actual bytes, inside write_chunk). On failure release the
         // provisional claim so the id is free again.
         if creating {
-            if let Err(e) = self.reserve(total_bytes) {
+            if let Err(e) = self.reserve_slot() {
                 self.meta.remove(transfer_id);
                 return Err(e);
             }
@@ -235,7 +243,9 @@ impl FileStore {
 
         let result = self.write_chunk(transfer_id, chunk_index, total_chunks, total_bytes, data, data_len, creating);
         if result.is_err() && creating {
-            self.release(total_bytes);
+            // No bytes were committed for a failed creation (write_chunk rolls back
+            // its own per-chunk byte reservation), so only the slot needs releasing.
+            self.release_slot();
             self.meta.remove(transfer_id);
         }
         result
@@ -254,8 +264,16 @@ impl FileStore {
         data_len: u64,
         creating: bool,
     ) -> Result<StoredChunk, FileReject> {
+        // Net bytes this chunk adds to (or, on a smaller re-upload, removes from)
+        // what the transfer holds against the global cap. The `add` side is
+        // reserved BEFORE the durable write and rolled back if anything fails; the
+        // `release` side is applied only after a successful commit. Captured here so
+        // both the abort and the commit paths can settle the global counter.
+        let mut reserved_add: u64 = 0;
+        let mut release_after_commit: u64 = 0;
+
         let txn = self.db.begin_write().map_err(|_| FileReject::Full)?;
-        let (received_chunks, stored_bytes, created_at_ms) = {
+        let write = (|| -> Result<(u32, u64, u64), FileReject> {
             let mut meta_table = txn.open_table(FILE_META).map_err(|_| FileReject::Full)?;
             let mut chunk_table = txn.open_table(FILE_CHUNKS).map_err(|_| FileReject::Full)?;
 
@@ -274,33 +292,73 @@ impl FileStore {
             let prev_len = chunk_table
                 .get(key.as_str())
                 .map_err(|_| FileReject::Full)?
-                .map(|v| v.value().len() as u64);
-            let new_stored = meta.stored_bytes - prev_len.unwrap_or(0) + data_len;
+                .map(|v| v.value().len() as u64)
+                .unwrap_or(0);
+            let new_stored = meta.stored_bytes - prev_len + data_len;
             // A client may not store more than it declared, nor exceed the cap.
             if new_stored > meta.total_bytes || new_stored > self.config.max_file_bytes {
                 return Err(FileReject::BadRequest);
             }
+            // Reserve the net increase against the GLOBAL byte cap before writing —
+            // by actual bytes, so a transfer can only hold what it really uploads.
+            // Rejected (Full) if it would push the whole store over the cap.
+            if data_len > prev_len {
+                self.try_reserve_bytes(data_len - prev_len)?;
+                reserved_add = data_len - prev_len;
+            } else {
+                release_after_commit = prev_len - data_len;
+            }
             meta.stored_bytes = new_stored;
-            if prev_len.is_none() {
+            if prev_len == 0 {
                 meta.received_chunks += 1;
             }
 
             chunk_table.insert(key.as_str(), data).map_err(|_| FileReject::Full)?;
             let meta_bytes = serde_json::to_vec(&meta).map_err(|_| FileReject::Full)?;
             meta_table.insert(transfer_id, meta_bytes.as_slice()).map_err(|_| FileReject::Full)?;
-            (meta.received_chunks, meta.stored_bytes, meta.created_at_ms)
+            Ok((meta.received_chunks, meta.stored_bytes, meta.created_at_ms))
+        })();
+
+        let (received_chunks, stored_bytes, created_at_ms) = match write {
+            Ok(v) => v,
+            Err(e) => {
+                // Roll back the bytes optimistically reserved for this aborted write.
+                if reserved_add > 0 { self.release_bytes(reserved_add); }
+                return Err(e);
+            }
         };
-        txn.commit().map_err(|_| FileReject::Full)?;
+        if txn.commit().is_err() {
+            if reserved_add > 0 { self.release_bytes(reserved_add); }
+            return Err(FileReject::Full);
+        }
+        // A smaller re-upload frees the difference; only after the commit makes it real.
+        if release_after_commit > 0 { self.release_bytes(release_after_commit); }
 
         // The count + reserved bytes were already accounted by `reserve` on the
         // creation path, so nothing to add here. Mirror the SAME created_at that
         // was just written to disk into the cache — not a fresh `now_ms()` — so a
         // later chunk can never bump the cached timestamp past the durable one and
         // skew TTL expiry (which sweeps off the cache) away from disk.
-        self.meta.insert(
-            transfer_id.to_string(),
-            FileMeta { total_chunks, total_bytes, stored_bytes, received_chunks, created_at_ms },
-        );
+        //
+        // Advance the cache, never regress it. redb serializes the write
+        // transactions, but their post-commit cache updates are not ordered, so two
+        // concurrent chunk writes could otherwise apply out of commit order and
+        // leave a stale `received_chunks`/`stored_bytes` behind. Keying the update
+        // on a non-decreasing `received_chunks` keeps the cache at the most-complete
+        // view that actually reached disk.
+        {
+            let mut e = self.meta.entry(transfer_id.to_string()).or_insert(FileMeta {
+                total_chunks,
+                total_bytes,
+                stored_bytes,
+                received_chunks,
+                created_at_ms,
+            });
+            if received_chunks >= e.received_chunks {
+                e.stored_bytes = stored_bytes;
+                e.received_chunks = received_chunks;
+            }
+        }
         Ok(StoredChunk { received_chunks, total_chunks })
     }
 
@@ -319,18 +377,20 @@ impl FileStore {
         }
     }
 
-    /// Delete a whole transfer (metadata + every chunk), releasing its reserved
-    /// bytes and count. Returns true if the transfer existed.
+    /// Delete a whole transfer (metadata + every chunk), releasing the bytes it
+    /// actually held and its count slot. Returns true if the transfer existed.
     pub(crate) fn delete_transfer(&self, transfer_id: &str) -> anyhow::Result<bool> {
         let (lo, hi) = chunk_bounds(transfer_id);
-        let mut reserved = 0u64;
+        let mut stored = 0u64;
         let mut existed = false;
         let txn = self.db.begin_write()?;
         {
             let mut meta_table = txn.open_table(FILE_META)?;
             if let Some(v) = meta_table.get(transfer_id)? {
                 if let Ok(meta) = serde_json::from_slice::<FileMeta>(v.value()) {
-                    reserved = meta.total_bytes;
+                    // Release the bytes ACTUALLY stored, matching what was reserved
+                    // per chunk — not the (possibly never-uploaded) declared size.
+                    stored = meta.stored_bytes;
                 }
                 existed = true;
             }
@@ -348,7 +408,8 @@ impl FileStore {
         txn.commit()?;
         if existed {
             self.meta.remove(transfer_id);
-            self.release(reserved);
+            self.release_slot();
+            self.release_bytes(stored);
         }
         Ok(existed)
     }
@@ -357,11 +418,22 @@ impl FileStore {
     /// Returns how many transfers were reclaimed. Intended to run periodically
     /// off the request path.
     pub(crate) fn sweep_expired(&self) -> anyhow::Result<usize> {
-        let cutoff = now_ms().saturating_sub(self.config.file_ttl_ms);
+        let now = now_ms();
+        let full_cutoff = now.saturating_sub(self.config.file_ttl_ms);
+        // Incomplete transfers expire on the much shorter incomplete window, so a
+        // flood of created-but-never-finished transfers cannot pin their reserved
+        // bytes for the full TTL. Never let that window exceed the operator's TTL
+        // (an operator may configure a very short file TTL).
+        let incomplete_cutoff = now
+            .saturating_sub(crate::config::INCOMPLETE_FILE_TTL_MS.min(self.config.file_ttl_ms));
         let expired: Vec<String> = self
             .meta
             .iter()
-            .filter(|e| e.value().created_at_ms < cutoff)
+            .filter(|e| {
+                let m = e.value();
+                let cutoff = if m.received_chunks >= m.total_chunks { full_cutoff } else { incomplete_cutoff };
+                m.created_at_ms < cutoff
+            })
             .map(|e| e.key().clone())
             .collect();
         let mut removed = 0usize;
@@ -373,28 +445,31 @@ impl FileStore {
         Ok(removed)
     }
 
-    /// Reserve a creation slot against both the transfer-count and global-byte
-    /// caps, atomically, so concurrent creations can never overshoot either. On
-    /// success the slot and bytes are recorded; the caller must `release` them if
-    /// the ensuing durable write fails (and `delete_transfer`/`sweep` release them
-    /// when a stored transfer goes away).
-    fn reserve(&self, total_bytes: u64) -> Result<(), FileReject> {
-        // Count cap first (cheap), reserved with a CAS loop.
+    /// Reserve a transfer-count slot, atomically, so concurrent creations can never
+    /// overshoot the count cap. The byte budget is reserved separately, per chunk,
+    /// by `try_reserve_bytes`. The caller releases the slot via `release_slot` when
+    /// the creation fails or the transfer goes away.
+    fn reserve_slot(&self) -> Result<(), FileReject> {
         loop {
             let cur = self.transfer_count.load(Ordering::Relaxed);
             if cur >= self.config.max_transfers {
                 return Err(FileReject::Full);
             }
             if self.transfer_count.compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                break;
+                return Ok(());
             }
         }
-        // Global byte cap. On failure, give the count slot back before returning.
+    }
+
+    /// Reserve `amount` more bytes against the global byte cap, atomically. Returns
+    /// `Err(Full)` (without reserving) if it would push the whole store over the
+    /// cap. Bytes are reserved by what is actually stored, so a transfer can only
+    /// ever hold what it has really uploaded.
+    fn try_reserve_bytes(&self, amount: u64) -> Result<(), FileReject> {
         loop {
             let cur = self.reserved_bytes.load(Ordering::Relaxed);
-            let next = cur.saturating_add(total_bytes);
+            let next = cur.saturating_add(amount);
             if next > self.config.max_total_file_bytes {
-                self.transfer_count.fetch_sub(1, Ordering::Relaxed);
                 return Err(FileReject::Full);
             }
             if self.reserved_bytes.compare_exchange(cur, next, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
@@ -403,12 +478,17 @@ impl FileStore {
         }
     }
 
-    /// Release a reservation made by `reserve`: both the count slot and the bytes.
-    fn release(&self, total_bytes: u64) {
+    /// Release a previously reserved transfer-count slot.
+    fn release_slot(&self) {
         self.transfer_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Release `amount` bytes back to the global byte budget. Saturating so any
+    /// accounting drift can never underflow.
+    fn release_bytes(&self, amount: u64) {
         let mut cur = self.reserved_bytes.load(Ordering::Relaxed);
         loop {
-            let next = cur.saturating_sub(total_bytes);
+            let next = cur.saturating_sub(amount);
             match self.reserved_bytes.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => return,
                 Err(observed) => cur = observed,
@@ -491,11 +571,69 @@ mod tests {
         store.store_chunk(id, 0, 2, 200, &vec![1u8; 100]).unwrap();
         store.store_chunk(id, 0, 2, 200, &vec![7u8; 100]).unwrap();
         assert_eq!(store.transfer_count.load(Ordering::Relaxed), 1);
-        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 200);
+        // Bytes are reserved by what is ACTUALLY stored, so a single 100-byte chunk
+        // (re-uploaded in place) holds 100 — not the 200 declared.
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 100);
         // Deleting once frees everything: no leaked reservation remains.
         assert!(store.delete_transfer(id).unwrap());
         assert_eq!(store.transfer_count.load(Ordering::Relaxed), 0);
         assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn declared_size_does_not_reserve_unsent_bytes() {
+        // A transfer that DECLARES a large size but uploads only a tiny chunk must
+        // hold only the bytes it actually sent against the global cap — otherwise a
+        // flood of declare-big/send-nothing transfers could reserve the whole file
+        // budget for almost free (the file-transfer DoS this guards against).
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("files.redb")).unwrap());
+        let config = FileConfig {
+            max_file_bytes: 1024 * 1024,
+            // Global budget only fits one max-size file.
+            max_total_file_bytes: 1024 * 1024,
+            file_ttl_ms: 60_000,
+            max_transfers: 100,
+            max_chunks: (1024 * 1024u64).div_ceil(16 * 1024) as u32,
+        };
+        let store = FileStore::new(db, config).unwrap();
+
+        // Declare a full 1 MiB transfer but upload a single 10-byte chunk.
+        let big = "transfer_declarebig00000";
+        store.store_chunk(big, 0, 2, 1024 * 1024, &vec![1u8; 10]).unwrap();
+        // Only the 10 bytes actually stored are reserved, not the 1 MiB declared.
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 10);
+
+        // The global budget is therefore still almost entirely free: a second
+        // transfer that actually uploads bytes succeeds.
+        let other = "transfer_realupload00000";
+        store.store_chunk(other, 0, 1, 500, &vec![2u8; 500]).unwrap();
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 510);
+        assert!(store.exists(other));
+    }
+
+    #[test]
+    fn global_byte_cap_rejects_actual_overflow() {
+        // The cap is still enforced against bytes that are really uploaded.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("files.redb")).unwrap());
+        let config = FileConfig {
+            max_file_bytes: 1024,
+            max_total_file_bytes: 1000,
+            file_ttl_ms: 60_000,
+            max_transfers: 100,
+            max_chunks: 64,
+        };
+        let store = FileStore::new(db, config).unwrap();
+        store.store_chunk("transfer_aaaaaaaaaaaaaaaa", 0, 1, 800, &vec![1u8; 800]).unwrap();
+        // 800 + 800 > 1000 global cap: the second upload's bytes are refused.
+        assert!(matches!(
+            store.store_chunk("transfer_bbbbbbbbbbbbbbbb", 0, 1, 800, &vec![2u8; 800]),
+            Err(FileReject::Full)
+        ));
+        // The rejected creation leaked neither a slot nor bytes.
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 800);
+        assert_eq!(store.transfer_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -546,5 +684,53 @@ mod tests {
         store.meta.get_mut(id).unwrap().created_at_ms = 1;
         assert_eq!(store.sweep_expired().unwrap(), 1);
         assert!(!store.exists(id));
+    }
+
+    #[test]
+    fn sweep_reclaims_incomplete_before_full_ttl() {
+        // A transfer missing chunks must be reclaimed on the short incomplete
+        // window even though the operator's full file TTL is far longer, so a
+        // created-but-never-finished transfer cannot pin its reserved bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::create(dir.path().join("files.redb")).unwrap());
+        let config = FileConfig {
+            max_file_bytes: 1024 * 1024,
+            max_total_file_bytes: 64 * 1024 * 1024,
+            file_ttl_ms: 24 * 60 * 60 * 1000, // long full TTL (24h)
+            max_transfers: 100,
+            max_chunks: (1024 * 1024u64).div_ceil(16 * 1024) as u32,
+        };
+        let store = FileStore::new(db, config).unwrap();
+
+        // Incomplete: 1 of 2 chunks. Reserves the full 200 declared bytes.
+        let incomplete = "transfer_incomplete00000";
+        store.store_chunk(incomplete, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        // Complete: both chunks present.
+        let complete = "transfer_complete0000000";
+        store.store_chunk(complete, 0, 2, 200, &vec![1u8; 100]).unwrap();
+        store.store_chunk(complete, 1, 2, 200, &vec![2u8; 100]).unwrap();
+
+        // Age both well past the incomplete window but inside the 24h full TTL.
+        let aged = now_ms().saturating_sub(crate::config::INCOMPLETE_FILE_TTL_MS + 60_000);
+        for id in [incomplete, complete] {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(FILE_META).unwrap();
+                let mut m: FileMeta = serde_json::from_slice(t.get(id).unwrap().unwrap().value()).unwrap();
+                m.created_at_ms = aged;
+                let b = serde_json::to_vec(&m).unwrap();
+                t.insert(id, b.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+            store.meta.get_mut(id).unwrap().created_at_ms = aged;
+        }
+
+        // Only the incomplete one is reclaimed; the complete one survives until
+        // its full TTL, and its reservation is released with it.
+        assert_eq!(store.sweep_expired().unwrap(), 1);
+        assert!(!store.exists(incomplete));
+        assert!(store.exists(complete));
+        assert_eq!(store.reserved_bytes.load(Ordering::Relaxed), 200);
+        assert_eq!(store.transfer_count.load(Ordering::Relaxed), 1);
     }
 }

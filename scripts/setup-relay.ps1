@@ -170,6 +170,11 @@ set "AXENO_BIND=$Bind"
 set "AXENO_DATA_DIR=%~dp0axeno-relay-data"
 "%~dp0axeno-relay.exe"
 "@ | Set-Content -Path $launcher -Encoding ASCII
+      # The launcher holds the at-rest key in cleartext. Lock it to SYSTEM,
+      # Administrators, and the invoking user so other local accounts cannot read
+      # it (the service path does the same for its launcher via icacls).
+      $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+      & icacls $launcher /inheritance:r /grant "SYSTEM:(R)" "Administrators:(R)" "${me}:(R)" | Out-Null
     }
     Info "Installed to $dest"
     if (-not $torOk) {

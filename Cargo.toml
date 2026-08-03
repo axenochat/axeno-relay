@@ -1,6 +1,6 @@
 [package]
 name = "axeno-relay"
-version = "0.1.6"
+version = "0.1.8"
 edition = "2021"
 description = "Minimal Axeno WebSocket relay server for opaque encrypted envelopes"
 
@@ -45,6 +45,7 @@ semver = "1"
 
 [dev-dependencies]
 tempfile = "3"
+tokio-tungstenite = "0.24"
 
 [patch.crates-io]
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }

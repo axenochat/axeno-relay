@@ -108,7 +108,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "axeno-relay"
-version = "0.1.6"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "argon2",
@@ -131,6 +131,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "tracing",
  "tracing-subscriber",

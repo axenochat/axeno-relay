@@ -30,7 +30,7 @@ Windows (in an **elevated** PowerShell):
 irm https://raw.githubusercontent.com/axenochat/axeno-relay/main/scripts/setup-relay.ps1 | iex
 ```
 
-Before running anything, both scripts verify the download against a `SHA256SUMS` manifest signed with the project's release key (the public key is pinned inside each script), and abort if the signature or checksum does not match. HTTPS alone is not trusted.
+Before running anything, both scripts verify the download against a `SHA256SUMS` manifest signed with the project's release key (the public key is pinned inside each script), and abort if the signature or checksum does not match. This protects the release **binaries** from tampering or asset-swapping even if GitHub's release storage is compromised. It does not — and cannot — protect against a compromise of this repository or the setup script itself, which is inherent to any `curl | bash` install; read the script before running it if that matters to you.
 
 **macOS note:** If you do not use the install script, you may run into issues with Gatekeeper, as I am not an "Official" Apple developer. To fix this simply run:
 ```

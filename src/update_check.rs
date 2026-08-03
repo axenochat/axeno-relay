@@ -51,7 +51,14 @@ fn mode() -> Mode {
         Err(_) => Mode::Default,
         Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Mode::Enabled,
-            _ => Mode::Disabled,
+            "0" | "false" | "no" | "off" | "" => Mode::Disabled,
+            // Fail private on anything unrecognized, but say so: a typo like
+            // `AXENO_UPDATE_CHECK=tor` silently disabling update notices would
+            // otherwise be very hard to notice.
+            other => {
+                warn!("AXENO_UPDATE_CHECK has unrecognized value {other:?}; treating as disabled (use 0 to disable or 1 to enable)");
+                Mode::Disabled
+            }
         },
     }
 }
